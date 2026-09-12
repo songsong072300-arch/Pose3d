@@ -3,7 +3,6 @@ archive_20260909/
 head_left_rgb_raw.mp4
 HCCEPose_src/cc0textures-512/
 HCCEPose_src/cc0textures-512.zip
-TripoSR/dataset/demo-bin-picking/train_pbr/*/rgb/*.jpg
 TripoSR/dataset/demo-bin-picking/train_pbr/*/depth/*.png
 TripoSR/dataset/demo-bin-picking/models/*.bak-*
 TripoSR/output/*/0/*.obj
@@ -13,3 +12,5 @@ TripoSR/models/TripoSR/model.ckpt
 TripoSR/dataset/demo-bin-picking/obj_000001.ply
 __pycache__/
 *.pyc
+checkpoints/
+outputs/
