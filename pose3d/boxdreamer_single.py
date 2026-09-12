@@ -56,7 +56,7 @@ class BoxDreamerSingle(nn.Module):
         nn.init.trunc_normal_(self.pos, std=.02)
         layer = nn.TransformerEncoderLayer(dim, heads, dim * 4, dropout,
                                            batch_first=True, norm_first=True, activation="gelu")
-        self.transformer = nn.TransformerEncoder(layer, depth)
+        self.transformer = nn.TransformerEncoder(layer, depth, enable_nested_tensor=False)
         self.norm = nn.LayerNorm(dim)
         self.head = nn.Linear(dim, out_channels * patch_size * patch_size)
 
