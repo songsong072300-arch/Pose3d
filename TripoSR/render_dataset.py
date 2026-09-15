@@ -1,11 +1,12 @@
 """阶段二：为手戴运动相机的位姿估计渲染合成训练数据（BOP 格式）。
 
 基于 HCCEPose 的 s2_p1_gen_pbr_data.py 适配：
-- 场景：模拟 ego 视角（头戴相机俯视工作区）
-  * 桌面平铺随机材质（域随机化背景）
-  * 两个同款相机模型随机位姿（对应左右手）
-  * 可选简化前臂与腕带（默认关闭，正式遮挡数据需使用更真实资产）
-  * 相机在上方区域随机采样，俯视工作区
+- 场景：第一人称（ego）视角
+  * 渲染相机位于头部/胸部高度，以 38~48 度俯仰角看向身前桌面
+  * 桌面平铺随机材质（域随机化背景，加大以填满俯视视野）
+  * 两个同款相机模型固定在左右手腕上方，位于画面中下部
+  * 左右前臂分别从画面左下/右下角伸向中央腕部，模拟双手在身前操作
+  * 可选简化前臂与腕带（仅作上下文/遮挡，不写入目标标注）
 - 输出：BOP 格式（RGB + 深度 + scene_gt.json 位姿标注）
 
 用法（在 dataset/demo-bin-picking 目录下运行）：
@@ -86,20 +87,31 @@ def create_segment(start, end, radius, material):
     return segment
 
 
-def add_wrist_context(wrist, camera_rotation, skin_material, strap_material,
+def add_wrist_context(wrist, camera_rotation, side, skin_material, strap_material,
                       cable_material, rng):
-    """Build a wrist/hand proxy whose geometry is tied to one camera wrist."""
+    """Build a wrist/hand proxy whose geometry is tied to one camera wrist.
+
+    side = -1 for the left arm (enters from the lower-left of the frame),
+    +1 for the right arm (lower-right). The forearm runs from an elbow near
+    the bottom corner of the ego view toward the wrist at the center,
+    mimicking hands operating in front of the chest.
+    """
     wrist = np.asarray(wrist, dtype=float)
     context = []
-    # Forearm points away from the camera wrist toward the lower image area.
-    forearm_end = wrist + np.array([rng.uniform(-0.015, 0.015), -0.16,
-                                    rng.uniform(-0.005, 0.008)])
-    arm = bproc.object.create_primitive("SPHERE", scale=[0.035, 0.145, 0.024],
-                                        location=(wrist + forearm_end) / 2.0)
-    arm.set_rotation_euler([rng.uniform(-0.08, 0.08), rng.uniform(-0.10, 0.10),
-                            rng.uniform(-0.12, 0.12)])
-    arm.replace_materials(skin_material)
-    context.append(arm)
+    # Forearm: elbow sits lower, closer to the rendering camera and off to the
+    # side, so the arm enters the frame from the lower-left/right corner.
+    elbow = wrist + np.array([side * rng.uniform(0.13, 0.19),
+                              rng.uniform(-0.34, -0.26),
+                              rng.uniform(-0.065, -0.025)])
+    elbow[2] = max(elbow[2], 0.032)  # forearm radius; keep above the table
+    arm = create_segment(wrist, elbow, rng.uniform(0.027, 0.033), skin_material)
+    if arm is not None:
+        context.append(arm)
+    # Rounded elbow so the arm ends naturally at the frame edge.
+    elbow_ball = bproc.object.create_primitive("SPHERE", scale=[0.030, 0.030, 0.030],
+                                                location=elbow)
+    elbow_ball.replace_materials(skin_material)
+    context.append(elbow_ball)
 
     # Keep the palm below and slightly behind the camera so the camera body
     # remains visible, as in the target wrist-mounted footage.
@@ -135,7 +147,7 @@ def add_wrist_context(wrist, camera_rotation, skin_material, strap_material,
     # Thin cable exiting the side of the camera toward the forearm.
     cable_start = wrist + camera_rotation @ np.array([0.0, 0.028, -0.005])
     cable_mid = wrist + np.array([rng.uniform(-0.01, 0.01), -0.055, -0.005])
-    cable_end = forearm_end + np.array([rng.uniform(-0.01, 0.01), 0.035, 0.0])
+    cable_end = elbow + np.array([rng.uniform(-0.01, 0.01), 0.035, 0.0])
     for a, b in ((cable_start, cable_mid), (cable_mid, cable_end)):
         cable = create_segment(a, b, 0.0022, cable_material)
         if cable is not None:
@@ -207,8 +219,8 @@ def main():
 
     bproc.loader.load_bop_intrinsics(bop_dataset_path=bop_dataset_path)
 
-    # 大面积工作台保证宽视角下不会露出虚拟世界背景。
-    table = bproc.object.create_primitive("PLANE", scale=[1.5, 1.5, 1.0], location=[0, 0, 0])
+    # 大面积工作台：第一人称俯视时视野上缘落在远处桌面，需加大避免露出虚拟背景。
+    table = bproc.object.create_primitive("PLANE", scale=[8.0, 8.0, 1.0], location=[0, 0, 0])
     table.set_name("table")
 
     # 环境光：顶部面光 + 点光源（渲染时随机化）
@@ -282,16 +294,16 @@ def main():
         light_point.set_color(np.random.uniform([0.5, 0.5, 0.5], [1, 1, 1]))
         light_point.set_location(np.random.uniform([-0.3, -0.3, 0.5], [0.3, 0.3, 0.8]))
 
-        # ---- 头戴相机与左右手腕的绑定空间关系 ----
-        target = np.array([0.0, 0.01, rng.uniform(0.115, 0.165)])
-        cam_loc = np.array([rng.uniform(-0.035, 0.035),
-                            rng.uniform(-0.20, -0.14),
-                            rng.uniform(0.25, 0.38)])
+        # ---- 第一人称取景：渲染相机模拟头部/胸部，俯视身前桌面 ----
+        cam_loc = np.array([rng.uniform(-0.04, 0.04),
+                            rng.uniform(-0.55, -0.42),
+                            rng.uniform(0.62, 0.80)])
 
-        x_spread = rng.uniform(0.068, 0.092)
+        # 手腕在身前桌面附近工作，相机机身固定在手腕上方（带安装噪声）。
+        x_spread = rng.uniform(0.09, 0.15)
         wrist_centers = [
-            np.array([-x_spread, rng.uniform(-0.005, 0.025), rng.uniform(0.073, 0.090)]),
-            np.array([ x_spread, rng.uniform(-0.005, 0.025), rng.uniform(0.073, 0.090)]),
+            np.array([-x_spread, rng.uniform(0.04, 0.18), rng.uniform(0.055, 0.090)]),
+            np.array([ x_spread, rng.uniform(0.04, 0.18), rng.uniform(0.055, 0.090)]),
         ]
         # The camera is mounted just above each wrist, with small mount noise.
         placed = [w + np.array([rng.uniform(-0.006, 0.006), rng.uniform(-0.006, 0.006),
@@ -321,9 +333,10 @@ def main():
         # ---- 简化前臂与腕带；仅作上下文/遮挡，不写入目标标注 ----
         context_objects = []
         if args.arms:
-            for wrist, (_, rotation_obj, _) in zip(wrist_centers, instance_poses):
+            for wrist, (_, rotation_obj, _), side in zip(
+                    wrist_centers, instance_poses, (-1.0, 1.0)):
                 context_objects.extend(add_wrist_context(
-                    wrist, rotation_obj, skin_material, strap_material,
+                    wrist, rotation_obj, side, skin_material, strap_material,
                     cable_material, rng))
 
         # Partial foreground occlusion resembling a finger crossing the body.
@@ -366,9 +379,15 @@ def main():
                 finger.replace_materials(skin_material)
                 context_objects.append(finger)
 
-        # ---- ego 相机位姿：上方俯视 ----
+        # ---- ego 相机位姿：头/胸高度，向下俯仰 38~48 度看向身前桌面 ----
+        pitch = rng.uniform(np.deg2rad(38.0), np.deg2rad(48.0))
+        yaw = rng.uniform(-0.06, 0.06)
+        forward = np.array([np.sin(yaw) * np.cos(pitch),
+                            np.cos(yaw) * np.cos(pitch),
+                            -np.sin(pitch)])
+        target = cam_loc + forward * rng.uniform(0.9, 1.3)
         rotation = bproc.camera.rotation_from_forward_vec(target - cam_loc,
-                                                         inplane_rot=rng.uniform(-0.12, 0.12))
+                                                          inplane_rot=rng.uniform(-0.08, 0.08))
         cam2world = bproc.math.build_transformation_mat(cam_loc, rotation)
         # Each loop builds and renders one independent scene. Reuse frame 0 so
         # previously added camera keyframes are not rendered again.

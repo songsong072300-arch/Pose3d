@@ -14,3 +14,4 @@ __pycache__/
 *.pyc
 checkpoints/
 outputs/
+TripoSR/dataset/ego-preview/
