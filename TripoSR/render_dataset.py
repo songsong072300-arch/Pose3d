@@ -6,7 +6,8 @@
   * 桌面为简单平面 + 高粗糙度纯色漫反射材质（无反光），颜色每帧随机
   * 场景上方 4 个弱强度、颜色微异的区域光，模拟均匀室内顶灯
   * 相机模型绑在小臂距手部几厘米处的护腕（宽短圆柱环）上，底面贴合护腕
-  * 左右前臂更粗，肘部位于渲染相机后下方（画面外），手臂从画面底部延伸进来
+  * 相机模型整体放大（--model-scale，默认 2.75），几何/标签/PnP 通过
+    render_config.json 同步缩放；遮挡椭球与护腕尺寸随之放大
 - 输出：BOP 格式（RGB + 深度 + scene_gt.json 位姿标注）
 
 用法（在 dataset/demo-bin-picking 目录下运行）：
@@ -89,7 +90,7 @@ def create_segment(start, end, radius, material):
 
 def add_wrist_context(wrist, elbow, mount, axis, arm_radius, band_radius,
                       cam_center, camera_rotation, skin_material, strap_material,
-                      cable_material, rng):
+                      cable_material, model_scale, rng):
     """Build one forearm proxy anchored to a wrist-mounted camera.
 
     Geometry is precomputed in main(): elbow sits behind and below the
@@ -111,43 +112,47 @@ def add_wrist_context(wrist, elbow, mount, axis, arm_radius, band_radius,
     elbow_ball.replace_materials(skin_material)
     context.append(elbow_ball)
 
-    # Thick velcro-style wristband: a wide short cylinder wrapped around the
-    # forearm at the mount point. Solid and slightly larger than the arm, so
-    # it reads as a band from any direction.
-    band_width = rng.uniform(0.028, 0.038)
+    # Thick velcro-style wristband: a wider short cylinder wrapped around the
+    # forearm at the mount point, sized to carry the enlarged camera body.
+    band_width = rng.uniform(0.040, 0.052) * model_scale ** 0.4
     band = create_segment(mount - axis * (band_width * 0.5),
                           mount + axis * (band_width * 0.5),
                           band_radius, strap_material)
     if band is not None:
         context.append(band)
 
-    # Hand proxy at the far end of the forearm (toward the working area).
-    palm = bproc.object.create_primitive("SPHERE", scale=[0.040, 0.035, 0.017],
-                                         location=wrist + np.array([0.0, 0.012, -0.020]))
+    # Oversized hand proxy at the far end of the forearm: clearly wider than
+    # the arm so it contributes a realistic occlusion area.
+    palm_half = np.array([0.100, 0.088, 0.043])
+    palm_center = wrist + np.array([0.0, 0.045, -0.008])
+    palm_center[2] = max(palm_center[2], palm_half[2] + 0.003)  # 不沉入桌面
+    palm = bproc.object.create_primitive("SPHERE", scale=list(palm_half),
+                                         location=palm_center)
     palm.set_rotation_mat(camera_rotation)
     palm.replace_materials(skin_material)
     context.append(palm)
 
-    # Two to three fingers reaching from the palm toward the camera; they may
-    # cross the body and act as a natural occluder.
+    # Two to three thick fingers reaching from the palm toward the camera;
+    # they may cross the body and act as a natural occluder.
     finger_count = rng.randint(2, 3)
     for finger_index in range(finger_count):
-        lateral = (finger_index - (finger_count - 1) / 2.0) * 0.014
-        start = wrist + np.array([lateral, 0.004, -0.002 + rng.uniform(-0.004, 0.004)])
+        lateral = (finger_index - (finger_count - 1) / 2.0) * 0.020
+        start = wrist + np.array([lateral, 0.010, 0.010 + rng.uniform(-0.006, 0.006)])
         toward_camera = cam_center - start
         toward_camera /= np.linalg.norm(toward_camera)
-        end = start + toward_camera * rng.uniform(0.035, 0.060)
-        finger = create_segment(start, end, rng.uniform(0.0055, 0.008), skin_material)
+        end = start + toward_camera * rng.uniform(0.050, 0.090)
+        finger = create_segment(start, end, rng.uniform(0.008, 0.011), skin_material)
         if finger is not None:
             context.append(finger)
             for point in (start, end):
-                tip = bproc.object.create_primitive("SPHERE", scale=[0.0065, 0.0065, 0.0065],
+                tip = bproc.object.create_primitive("SPHERE", scale=[0.009, 0.009, 0.009],
                                                     location=point)
                 tip.replace_materials(skin_material)
                 context.append(tip)
 
     # Thin cable hanging from the camera's side, under the arm toward the elbow.
-    cable_start = cam_center + camera_rotation @ np.array([0.0, 0.030, -0.004])
+    cable_start = cam_center + camera_rotation @ (
+        np.array([0.0, 0.030, -0.005]) * model_scale)
     cable_mid = mount + np.array([rng.uniform(-0.012, 0.012), rng.uniform(0.000, 0.020),
                                   -(arm_radius + rng.uniform(0.002, 0.008))])
     cable_end = elbow + np.array([rng.uniform(-0.01, 0.01), 0.03, 0.0])
@@ -158,9 +163,9 @@ def add_wrist_context(wrist, elbow, mount, axis, arm_radius, band_radius,
     return context
 
 
-def place_on_surface(location, rotation, clearance=0.003):
+def place_on_surface(location, rotation, clearance=0.003, model_scale=1.0):
     """Set Z so the rotated metric bounding box rests above the table."""
-    half_extents = np.array([0.0164, 0.03525, 0.0221])
+    half_extents = np.array([0.0164, 0.03525, 0.0221]) * model_scale
     corners = np.array([
         [x, y, z]
         for x in (-half_extents[0], half_extents[0])
@@ -184,6 +189,9 @@ def main():
     parser.add_argument("--seed", type=int, default=7, help="随机种子")
     parser.add_argument("--arms", action=argparse.BooleanOptionalAction, default=True,
                         help="生成与左右腕绑定的前臂、手掌、手指、腕带和线缆（默认开启）")
+    parser.add_argument("--model-scale", type=float, default=2.75,
+                        help="目标相机模型整体放大倍数（2.5~3，模拟相机与手腕的视觉比例）。"
+                             "渲染几何与标签角点会同步缩放，并写入 render_config.json")
     parser.add_argument("--front-probability", type=float, default=0.20,
                         help="正面视角概率")
     parser.add_argument("--back-probability", type=float, default=0.20,
@@ -211,7 +219,11 @@ def main():
     cam_json = os.path.join(current_dir, "camera.json")
     with open(cam_json, "w") as f:
         json.dump({"cx": W / 2.0, "cy": H / 2.0, "depth_scale": 0.1,
-                  "fx": fx, "fy": fy, "height": H, "width": W}, f, indent=2)
+                   "fx": fx, "fy": fy, "height": H, "width": W}, f, indent=2)
+    # 记录模型缩放倍数，供标签生成与 PnP 端同步使用。
+    render_config_json = os.path.join(current_dir, "render_config.json")
+    with open(render_config_json, "w") as f:
+        json.dump({"model_scale": args.model_scale}, f, indent=2)
 
     bproc.init()
 
@@ -278,13 +290,29 @@ def main():
     for obj in objs:
         obj.set_shading_mode("auto")
 
+    # Enlarge the camera body: bake the scale into mesh vertices (object scale
+    # stays untouched so BOP pose annotations keep their original convention).
+    # Both instances may share one mesh datablock; scale each block only once.
+    scaled_meshes = set()
+    for obj in objs:
+        mesh = obj.blender_obj.data
+        if mesh.name in scaled_meshes:
+            continue
+        for vertex in mesh.vertices:
+            vertex.co = vertex.co * args.model_scale
+        scaled_meshes.add(mesh.name)
+
     # The source image does not show the rear screen. Add a conservative proxy
     # at local +X so rear/oblique views resemble the physical camera.
     rear_parts = []
     for _ in objs:
-        bezel = bproc.object.create_primitive("CUBE", scale=[0.0010, 0.0310, 0.0188])
+        bezel = bproc.object.create_primitive(
+            "CUBE", scale=[0.0010 * args.model_scale, 0.0310 * args.model_scale,
+                           0.0188 * args.model_scale])
         bezel.replace_materials(bezel_material)
-        display = bproc.object.create_primitive("CUBE", scale=[0.0006, 0.0287, 0.0165])
+        display = bproc.object.create_primitive(
+            "CUBE", scale=[0.0006 * args.model_scale, 0.0287 * args.model_scale,
+                           0.0165 * args.model_scale])
         display.replace_materials(display_material)
         rear_parts.append((bezel, display))
 
@@ -310,15 +338,16 @@ def main():
                                       rng.uniform(0.93, 1.05)]))
 
         # ---- 第一人称取景：渲染相机模拟头部/胸部，俯视身前桌面 ----
+        # 手臂整体向渲染相机大幅拉近，让手臂+相机占据画面下部 30%~40%。
         cam_loc = np.array([rng.uniform(-0.04, 0.04),
-                            rng.uniform(-0.40, -0.30),
-                            rng.uniform(0.55, 0.75)])
+                            rng.uniform(-0.36, -0.26),
+                            rng.uniform(0.50, 0.68)])
 
-        # 手部锚点在身前近处；相机模型绑在小臂后段的护腕上（见下）。
+        # 手部锚点拉近到身前近处；放大后的相机模型绑在小臂后段的护腕上。
         x_spread = rng.uniform(0.09, 0.15)
         wrist_centers = [
-            np.array([-x_spread, rng.uniform(-0.02, 0.10), rng.uniform(0.055, 0.090)]),
-            np.array([ x_spread, rng.uniform(-0.02, 0.10), rng.uniform(0.055, 0.090)]),
+            np.array([-x_spread, rng.uniform(-0.14, -0.02), rng.uniform(0.055, 0.090)]),
+            np.array([ x_spread, rng.uniform(-0.14, -0.02), rng.uniform(0.055, 0.090)]),
         ]
 
         # ---- 每条手臂的几何：肘部在渲染相机后下方（画面外） ----
@@ -331,8 +360,8 @@ def main():
             axis /= np.linalg.norm(axis)
             # 挂载点：沿小臂从手部向后退几厘米，相机绑在此处的护腕上。
             mount = wrist + axis * rng.uniform(0.045, 0.075)
-            arm_radius = rng.uniform(0.036, 0.044)       # 更粗的前臂
-            band_radius = arm_radius + rng.uniform(0.005, 0.009)
+            arm_radius = rng.uniform(0.044, 0.052)       # 更粗的前臂，避免细长筷子感
+            band_radius = arm_radius + rng.uniform(0.008, 0.014)
             arm_info.append(dict(wrist=wrist, elbow=elbow, mount=mount, axis=axis,
                                  arm_radius=arm_radius, band_radius=band_radius))
 
@@ -348,13 +377,14 @@ def main():
                 weights=[args.front_probability, args.back_probability,
                          side_probability * 0.5, side_probability * 0.5], k=1)[0]
             if args.arms:
-                # 相机底面贴合护腕：沿垂直于手臂轴的"上"方向偏移（含半包围盒）。
+                # 相机底面贴合护腕：沿垂直于手臂轴的"上"方向偏移（含缩放后的半包围盒，
+                # 支撑函数取最坏角点，任意扰动旋转下都不会穿入护腕/手臂）。
                 rotation_obj = wrist_camera_rotation(
                     info["mount"], cam_loc, view_mode=view_mode, rng=rng)
                 up = np.array([0.0, 0.0, 1.0])
                 normal = up - np.dot(up, info["axis"]) * info["axis"]
                 normal /= np.linalg.norm(normal)
-                half_extents = np.array([0.0164, 0.03525, 0.0221])
+                half_extents = np.array([0.0164, 0.03525, 0.0221]) * args.model_scale
                 box_corners = np.array([
                     [sx, sy, sz]
                     for sx in (-half_extents[0], half_extents[0])
@@ -362,19 +392,19 @@ def main():
                     for sz in (-half_extents[2], half_extents[2])])
                 half_along_normal = float(np.max(np.abs(box_corners @ normal)))
                 loc = info["mount"] + normal * (
-                    info["band_radius"] + half_along_normal + rng.uniform(0.0, 0.003))
+                    info["band_radius"] + half_along_normal + rng.uniform(0.0, 0.005))
             else:
                 loc = wrist_centers[index] + np.array([rng.uniform(-0.006, 0.006),
                                                        rng.uniform(-0.006, 0.006), 0.03])
                 rotation_obj = wrist_camera_rotation(
                     loc, cam_loc, view_mode=view_mode, rng=rng)
-                loc = place_on_surface(loc, rotation_obj)
+                loc = place_on_surface(loc, rotation_obj, model_scale=args.model_scale)
             info["cam_center"] = loc
             obj.set_location(loc)
             obj.set_rotation_mat(rotation_obj)
             bezel, display = rear_parts[index]
-            set_local_pose(bezel, loc, rotation_obj, [0.0153, 0.0, 0.0])
-            set_local_pose(display, loc, rotation_obj, [0.0160, 0.0, 0.0])
+            set_local_pose(bezel, loc, rotation_obj, [0.0153 * args.model_scale, 0.0, 0.0])
+            set_local_pose(display, loc, rotation_obj, [0.0160 * args.model_scale, 0.0, 0.0])
             instance_poses.append((loc, rotation_obj, view_mode))
 
         # ---- 前臂 + 护腕 + 手部代理；仅作上下文/遮挡，不写入目标标注 ----
@@ -384,7 +414,8 @@ def main():
                 context_objects.extend(add_wrist_context(
                     info["wrist"], info["elbow"], info["mount"], info["axis"],
                     info["arm_radius"], info["band_radius"], info["cam_center"],
-                    rotation_obj, skin_material, strap_material, cable_material, rng))
+                    rotation_obj, skin_material, strap_material, cable_material,
+                    args.model_scale, rng))
 
         # Partial foreground occlusion resembling a finger crossing the body.
         occlusion_levels = []
@@ -401,12 +432,17 @@ def main():
             horizontal = np.cross(toward_camera, np.array([0.0, 0.0, 1.0]))
             horizontal /= np.linalg.norm(horizontal)
             vertical = np.cross(horizontal, toward_camera)
+            # 遮挡椭球的尺寸与摆放随模型缩放同步放大，保持遮挡等级的相对面积。
             ranges = {
                 "light": ((0.004, 0.006), (0.012, 0.020), (0.003, 0.005), (0.018, 0.027)),
                 "medium": ((0.006, 0.009), (0.020, 0.032), (0.004, 0.006), (0.010, 0.021)),
                 "heavy": ((0.011, 0.016), (0.030, 0.043), (0.006, 0.009), (0.000, 0.010)),
             }
             short_range, long_range, depth_range, offset_range = ranges[level]
+            short_range = tuple(v * args.model_scale for v in short_range)
+            long_range = tuple(v * args.model_scale for v in long_range)
+            depth_range = tuple(v * args.model_scale for v in depth_range)
+            offset_range = tuple(v * args.model_scale for v in offset_range)
             for _ in range(1):
                 angle = rng.uniform(-1.05, 1.05)
                 long_axis = np.cos(angle) * horizontal + np.sin(angle) * vertical
@@ -420,9 +456,9 @@ def main():
                                      rng.uniform(*long_range),
                                      rng.uniform(*depth_range)])
                 finger.set_rotation_mat(finger_rotation)
-                finger.set_location(loc + toward_camera * rng.uniform(0.020, 0.030)
+                finger.set_location(loc + toward_camera * rng.uniform(0.020, 0.030) * args.model_scale
                                     + horizontal * offset
-                                    + vertical * rng.uniform(-0.012, 0.012))
+                                    + vertical * rng.uniform(-0.012, 0.012) * args.model_scale)
                 finger.replace_materials(skin_material)
                 context_objects.append(finger)
 

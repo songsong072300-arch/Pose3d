@@ -60,12 +60,18 @@ def main():
     args = parse_args()
     dataset = args.dataset.expanduser().resolve()
     models_info = json.loads((dataset / "models" / "models_info.json").read_text())
+    # 渲染器若对模型做了整体缩放（render_config.json），角点真值需同步缩放，
+    # 否则热图标签与渲染机身不重合。
+    model_scale = 1.0
+    render_config_path = dataset / "render_config.json"
+    if render_config_path.exists():
+        model_scale = float(json.loads(render_config_path.read_text()).get("model_scale", 1.0))
     output_root = dataset / "corner_labels"
     heatmap_dir = output_root / "heatmaps"
     heatmap_dir.mkdir(parents=True, exist_ok=True)
 
     records = []
-    channel_order = bbox_corners(models_info["1"]).tolist()
+    channel_order = (bbox_corners(models_info["1"]) * model_scale).tolist()
     for scene_dir in sorted((dataset / "train_pbr").glob("[0-9][0-9][0-9][0-9][0-9][0-9]")):
         scene_gt = json.loads((scene_dir / "scene_gt.json").read_text())
         scene_camera = json.loads((scene_dir / "scene_camera.json").read_text())
@@ -79,7 +85,7 @@ def main():
             heatmaps = np.zeros((8, args.heatmap_height, args.heatmap_width), dtype=np.float32)
             instances_out = []
             for instance_index, instance in enumerate(scene_gt[frame_key]):
-                corners_3d = bbox_corners(models_info[str(instance["obj_id"])])
+                corners_3d = bbox_corners(models_info[str(instance["obj_id"])]) * model_scale
                 pixels, depths = project(corners_3d, instance, K)
                 in_frame = ((pixels[:, 0] >= 0) & (pixels[:, 0] < width)
                             & (pixels[:, 1] >= 0) & (pixels[:, 1] < height)
