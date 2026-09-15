@@ -169,13 +169,18 @@ def main():
     parser.add_argument("--arms", action=argparse.BooleanOptionalAction, default=True,
                         help="生成与左右腕绑定的前臂、手掌、手指、腕带和线缆（默认开启）")
     parser.add_argument("--front-probability", type=float, default=0.20,
-                        help="正面视角概率；默认按 20%% 正面、40%% 背面、40%% 侧面采样")
+                        help="正面视角概率")
+    parser.add_argument("--back-probability", type=float, default=0.20,
+                        help="背面视角概率；侧面 = 1 - 正面 - 背面，均分给左右两个侧面。"
+                             "默认 0.20/0.20/0.60 即 背:正:侧 = 1:1:3")
     parser.add_argument("--occlusion-probability", type=float, default=0.55,
                         help="每个实例出现遮挡的总概率；遮挡内部再随机轻/中/重等级")
     parser.add_argument("--samples", type=int, default=8, help="Cycles 每像素采样数")
     parser.add_argument("--bop-masks", action="store_true",
                         help="额外生成 BOP mask/info/COCO（较慢，macOS 使用单进程）")
     args = parser.parse_args()
+    if args.front_probability + args.back_probability > 1.0:
+        parser.error("--front-probability 与 --back-probability 之和不能超过 1.0")
 
     current_dir = os.path.abspath(os.getcwd())
     dataset_name = os.path.basename(current_dir)
@@ -296,11 +301,11 @@ def main():
             mat.set_principled_shader_value("Roughness", np.random.uniform(0.2, 0.9))
         instance_poses = []
         for index, (obj, loc) in enumerate(zip(objs, placed)):
-            remaining = max(0.0, 1.0 - args.front_probability)
+            side_probability = max(0.0, 1.0 - args.front_probability - args.back_probability)
             view_mode = rng.choices(
                 ["front", "back", "side_plus_y", "side_minus_y"],
-                weights=[args.front_probability, remaining * 0.50,
-                         remaining * 0.25, remaining * 0.25], k=1)[0]
+                weights=[args.front_probability, args.back_probability,
+                         side_probability * 0.5, side_probability * 0.5], k=1)[0]
             rotation_obj = wrist_camera_rotation(
                 loc, cam_loc, view_mode=view_mode, rng=rng)
             if not args.arms:
