@@ -23,7 +23,7 @@ class RoiPoseDataset(torch.utils.data.Dataset):
     def __len__(self): return len(self.items)
     def __getitem__(self,i):
         r,ins=self.items[i]; im=Image.open(self.root/r['image']).convert('RGB'); W,H=im.size; p=np.asarray(ins['corners_2d'],np.float32); x1,y1=p.min(0); x2,y2=p.max(0); dx,dy=(x2-x1)*self.pad,(y2-y1)*self.pad; xa,ya,xb,yb=max(0,x1-dx),max(0,y1-dy),min(W,x2+dx),min(H,y2+dy); crop=im.crop((xa,ya,xb,yb)).resize((240,180),Image.Resampling.BILINEAR); x=torch.from_numpy(np.asarray(crop,np.float32)).permute(2,0,1)/255.; x=(x-torch.tensor([.485,.456,.406])[:,None,None])/torch.tensor([.229,.224,.225])[:,None,None]
-        q=(p-[xa,ya])*[240/(xb-xa),180/(yb-ya)]; yy,xx=np.mgrid[0:180,0:240]; h=np.zeros((8,180,240),np.float32); sigma=max(2.,min(x2-x1,y2-y1)*240/(xb-xa)/18.)
+        q=(p-[xa,ya])*[240/(xb-xa),180/(yb-ya)]; yy,xx=np.mgrid[0:180,0:240]; h=np.zeros((8,180,240),np.float32); sigma=max(2.,min((x2-x1)*240/(xb-xa),(y2-y1)*180/(yb-ya))/18.)
         for c,(u,v) in enumerate(q): h[c]=np.exp(-((xx-u)**2+(yy-v)**2)/(2*sigma*sigma))
         return {'image':x,'heatmap':torch.from_numpy(h),'corners':torch.from_numpy(q),'id':r['id']+'_'+str(ins['instance_id'])}
 
