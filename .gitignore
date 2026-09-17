@@ -14,4 +14,7 @@ __pycache__/
 *.pyc
 checkpoints/
 outputs/
+yolov8n.pt
+.vscode/
+手搓_pose3d/
 TripoSR/dataset/ego-preview/
