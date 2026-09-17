@@ -8,7 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import cv2, numpy as np, torch
 from PIL import Image
-from .boxdreamer_single import BoxDreamerSingle
+from .boxdreamer_single import BoxDreamerSingle, build_net
 
 class RoiPoseDataset(torch.utils.data.Dataset):
     """Derive single-instance ROI samples from existing BOP annotations."""
@@ -66,8 +66,13 @@ class VideoPosePipeline:
                  detector_weights=None, device="auto", crop_pad=.15):
         self.device = ("cuda" if torch.cuda.is_available() else
                        "mps" if getattr(torch.backends,"mps",None) is not None and torch.backends.mps.is_available() else "cpu") if device=="auto" else device
-        self.net=BoxDreamerSingle().to(self.device).eval()
-        ck=torch.load(corner_weights,map_location=self.device); self.net.load_state_dict(ck.get("model",ck),strict=True)
+        ck = torch.load(corner_weights, map_location=self.device)
+        if isinstance(ck, dict) and ck.get("arch") == "dinov2":
+            self.net = build_net("dinov2", variant=ck.get("dinov2_variant", "base"))
+        else:
+            self.net = BoxDreamerSingle()
+        self.net = self.net.to(self.device).eval()
+        self.net.load_state_dict(ck.get("model", ck) if isinstance(ck, dict) else ck, strict=True)
         self.obj=np.asarray(object_points,np.float32); self.K=np.asarray(camera_matrix,np.float32); self.dist=np.zeros(5,np.float32) if dist is None else np.asarray(dist,np.float32)
         self.crop_pad=crop_pad; self.tracker=EMATracker()
         if detector_weights:

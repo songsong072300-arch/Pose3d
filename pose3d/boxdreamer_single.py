@@ -91,3 +91,63 @@ def heatmap_loss(pred, target, peak_weight=100.0):
     diff = torch.abs(pred - target)
     elementwise = torch.where(diff < 1.0, 0.5 * diff * diff, diff - 0.5)
     return (elementwise * weights).mean()
+
+
+_DINO_VARIANTS = {"small": "dinov2_vits14", "base": "dinov2_vitb14", "large": "dinov2_vitl14"}
+
+
+class DinoCornerNet(nn.Module):
+    """Frozen DINOv2 backbone + conv decoder (paper-style pretrained path).
+
+    BoxDreamer Sec 3.2 uses DINOv2 patch features; here the backbone is
+    frozen and only a small decoder is trained. Inputs of any size are
+    resized to a multiple of patch 14 internally; the decoded heatmap is
+    always interpolated back to `heatmap_size` to stay label-aligned.
+    """
+
+    def __init__(self, out_channels=8, heatmap_size=(180, 240), variant="base"):
+        super().__init__()
+        name = _DINO_VARIANTS[variant]
+        self.backbone = torch.hub.load("facebookresearch/dinov2", name)
+        self.backbone.eval()
+        for p in self.backbone.parameters():
+            p.requires_grad_(False)
+        dim = self.backbone.embed_dim
+        self.heatmap_size = tuple(heatmap_size)
+        self.decoder = nn.Sequential(
+            nn.Conv2d(dim, 256, 3, padding=1), nn.GELU(),
+            nn.Conv2d(256, 128, 3, padding=1), nn.GELU(),
+            nn.Conv2d(128, out_channels, 1),
+        )
+        nn.init.constant_(self.decoder[-1].bias, -4.0)  # sparse-target init
+
+    def train(self, mode=True):
+        # Keep the frozen backbone in eval mode (dropout/BN-free but explicit).
+        super().train(mode)
+        self.backbone.eval()
+        return self
+
+    def forward(self, image):
+        B, _, H, W = image.shape
+        h14 = max(14, round(H / 14) * 14)
+        w14 = max(14, round(W / 14) * 14)
+        x = F.interpolate(image, size=(h14, w14), mode="bilinear", align_corners=False)
+        with torch.no_grad():
+            feats = self.backbone.forward_features(x)  # (B, 1+N, D) or dict
+        # Newer DINOv2 returns a dict; older returns CLS+patch tokens.
+        tokens = feats["x_norm_patchtokens"] if isinstance(feats, dict) else feats[:, 1:, :]
+        fmap = tokens.transpose(1, 2).reshape(B, -1, h14 // 14, w14 // 14)
+        y = F.interpolate(fmap, scale_factor=2.0, mode="bilinear", align_corners=False)
+        y = self.decoder[0:2](y)
+        y = F.interpolate(y, size=self.heatmap_size, mode="bilinear", align_corners=False)
+        y = self.decoder[2:](y)
+        return torch.sigmoid(y)
+
+
+def build_net(arch="scratch", **kwargs):
+    if arch == "scratch":
+        return BoxDreamerSingle(**kwargs)
+    if arch == "dinov2":
+        return DinoCornerNet(**{k: v for k, v in kwargs.items()
+                                if k in ("out_channels", "heatmap_size", "variant")})
+    raise ValueError(f"unknown arch: {arch}")

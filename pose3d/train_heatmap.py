@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from .boxdreamer_single import PoseHeatmapDataset, BoxDreamerSingle, heatmap_loss
+from .boxdreamer_single import PoseHeatmapDataset, heatmap_loss, build_net
 from .roi_pipeline import RoiPoseDataset
 
 
@@ -40,6 +40,10 @@ def main():
     ap.add_argument("--workers", type=int, default=0)
     ap.add_argument("--amp", action="store_true", help="CUDA 混合精度（游戏本提速）")
     ap.add_argument("--roi", action="store_true", help="train on per-instance ROI labels")
+    ap.add_argument("--arch", default="scratch", choices=["scratch", "dinov2"],
+                    help="scratch=从零小Transformer；dinov2=冻结DINOv2+解码头（论文方案）")
+    ap.add_argument("--dinov2-variant", default="base", choices=["small", "base", "large"],
+                    help="DINOv2 规格：small(22M)/base(86M,论文同款)/large(300M)")
     args = ap.parse_args()
 
     torch.manual_seed(args.seed)
@@ -64,11 +68,17 @@ def main():
     use_pin = device == "cuda"
     dl = DataLoader(ds, args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=use_pin)
     vl = DataLoader(va, args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=use_pin)
-    net = BoxDreamerSingle().to(device)
-    print(f"params: {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
+    if args.arch == "dinov2":
+        net = build_net("dinov2", variant=args.dinov2_variant).to(device)
+    else:
+        net = build_net("scratch").to(device)
+    trainable = [p for p in net.parameters() if p.requires_grad]
+    print(f"arch: {args.arch}({args.dinov2_variant if args.arch == 'dinov2' else '-'})  "
+          f"params: {sum(p.numel() for p in net.parameters()) / 1e6:.2f}M  "
+          f"trainable: {sum(p.numel() for p in trainable) / 1e6:.2f}M  "
           f"train: {len(ds)}  val: {len(va)}")
 
-    opt = torch.optim.AdamW(net.parameters(), lr=args.lr, weight_decay=1e-4)
+    opt = torch.optim.AdamW(trainable, lr=args.lr, weight_decay=1e-4)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 
@@ -106,7 +116,9 @@ def main():
             path = pathlib.Path(args.out)
             path.parent.mkdir(parents=True, exist_ok=True)
             torch.save({"model": net.state_dict(), "epoch": epoch + 1,
-                        "val_loss": val, "val_corner_err": cerr}, path)
+                        "val_loss": val, "val_corner_err": cerr,
+                        "arch": args.arch,
+                        "dinov2_variant": args.dinov2_variant}, path)
     print(f"saved: {args.out}  best val_loss: {best:.5f}")
 
 
