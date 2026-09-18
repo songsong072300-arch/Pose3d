@@ -1,2 +1,1 @@
-"""Pose3D training modules."""
-
+"""DJI Action camera corner detection package."""
