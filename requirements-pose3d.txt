@@ -1,13 +1,12 @@
-# pose3d 环境依赖（训练/推理角点热图网络）
-# 游戏本安装（CUDA 版 torch 请按本机 CUDA 版本去 https://pytorch.org 换 index-url）：
-#   conda create -n pose3d python=3.10
-#   conda activate pose3d
-#   pip install torch==2.14.0 torchvision==0.29.0 --index-url https://download.pytorch.org/whl/cu126
-#   pip install -r requirements-pose3d.txt
-# 视频推理需要检测器时再装: pip install ultralytics
-torch==2.14.0
-torchvision==0.29.0
-numpy==2.2.6
-opencv-python-headless==5.0.0.93
-pillow==12.3.0
-scipy==1.15.3
+# pose3d 普通 Python 依赖（训练/推理角点热图网络）
+#
+# 先按 https://pytorch.org/get-started/locally/ 为当前 NVIDIA 驱动安装互相匹配的
+# torch/torchvision CUDA wheel，然后再执行：
+#   python -m pip install -r requirements-pose3d.txt
+#
+# 视频或双实例推理使用 YOLO 时再安装：
+#   python -m pip install ultralytics
+numpy>=1.26,<3
+opencv-python-headless>=4.10,<5
+pillow>=10,<13
+scipy>=1.11,<2
