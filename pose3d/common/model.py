@@ -21,8 +21,26 @@ class ConvNormAct(nn.Sequential):
 
 
 class CornerHeatmapNet(nn.Module):
-    """Frozen DINOv2-Small features plus a spatial fusion decoder."""
+    """
+    backbone(dinov2) (冻结参数)
+    |
+    Conv (1*1)
+    |
+    ConvNormAct () —— Conv
+    |                  |
+    ConvNormAct     GroupNorm 
+    |                  | 
+    ConvNormAct       GELU
+    |
+    ConvNormAct
+    |
+    Conv
+    |
+    sigmoid
 
+    in: image(B, 3, 168, 224)
+    out: (B, 8, 168, 224)
+    """
     def __init__(self):
         super().__init__()
         self.backbone = torch.hub.load(
@@ -31,6 +49,10 @@ class CornerHeatmapNet(nn.Module):
         self.backbone.eval()
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(False)
+        for parameter in self.backbone.blocks[-2:].parameters():
+            parameter.requires_grad_(True)
+        for parameter in self.backbone.norm.parameters():
+            parameter.requires_grad_(True)
 
         feature_dim = self.backbone.embed_dim
         self.projections = nn.ModuleList([
@@ -49,7 +71,10 @@ class CornerHeatmapNet(nn.Module):
 
     def train(self, mode=True):
         super().train(mode)
-        self.backbone.eval()
+        if mode == True:
+            self.backbone.train()
+        else :
+            self.backbone.eval()
         return self
 
     def forward(self, image):

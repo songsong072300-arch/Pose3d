@@ -73,6 +73,11 @@ def main():
     val_loader = DataLoader(val_set, shuffle=False, **loader_args)
 
     net = CornerHeatmapNet().to(device)
+    for parameter in net.backbone.blocks[-2:].parameters():
+        parameter.requires_grad_(True)
+    # 开放最后的 LayerNorm 层
+    for parameter in net.backbone.norm.parameters():
+        parameter.requires_grad_(True)
     trainable = [parameter for parameter in net.parameters()
                  if parameter.requires_grad]
     print(
@@ -145,7 +150,7 @@ def main():
                 if not name.startswith("backbone.")
             }
             torch.save({
-                "decoder": decoder_state,
+                "model_state": net.state_dict(),
                 "epoch": epoch + 1,
                 "val_loss": val_loss,
                 "val_corner_err": val_error,

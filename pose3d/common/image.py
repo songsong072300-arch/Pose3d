@@ -13,6 +13,7 @@ IMAGENET_STD = torch.tensor([0.229, 0.224, 0.225])[:, None, None]
 
 
 def image_to_tensor(image: Image.Image) -> torch.Tensor:
+    # 进行image的归一化
     array = np.asarray(image, dtype=np.float32)
     tensor = torch.from_numpy(array).permute(2, 0, 1) / 255.0
     return (tensor - IMAGENET_MEAN) / IMAGENET_STD
