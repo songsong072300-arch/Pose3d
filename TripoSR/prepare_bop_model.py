@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert a TripoSR OBJ into a metric BOP PLY model.
+"""Convert an OBJ into a metric BOP PLY model.
 
 The default axis mapping is specific to the camera used by this project:
 X = depth (32.8 mm), Y = width (70.5 mm), Z = height (44.2 mm).
@@ -31,6 +31,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--input", type=Path, default=DEFAULT_INPUT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--obj-id", type=int, default=1)
+    parser.add_argument(
+        "--source-layout",
+        choices=("triposr", "action4-export"),
+        default="triposr",
+        help=("Source axes. action4-export maps source X/Y/Z="
+              "width/height/front-depth into project depth/width/height axes."),
+    )
     parser.add_argument("--x-mm", type=float, default=32.8, help="X size: camera depth")
     parser.add_argument("--y-mm", type=float, default=70.5, help="Y size: camera width")
     parser.add_argument("--z-mm", type=float, default=44.2, help="Z size: camera height")
@@ -129,13 +136,23 @@ def main() -> None:
         raise ValueError("All target dimensions must be positive")
 
     mesh = load_mesh(input_path)
+    source_vertices = np.asarray(mesh.vertices, dtype=np.float64)
+    if args.source_layout == "action4-export":
+        # Regenerated model: X=width, Y=height, +Z=lens/front. This is a
+        # proper rotation and maps the lens to the project convention, -X.
+        mesh.vertices = np.column_stack((
+            -source_vertices[:, 2], -source_vertices[:, 0], source_vertices[:, 1]))
+        effective_lens_direction = "-x"
+    else:
+        effective_lens_direction = args.source_lens_direction
+
     source_size = np.asarray(mesh.extents, dtype=np.float64)
     if np.any(source_size <= 0):
         raise ValueError(f"Invalid source extents: {source_size}")
 
     # Scale each axis independently to the measured physical dimensions.
     mesh.vertices = np.asarray(mesh.vertices, dtype=np.float64) * (target_size / source_size)
-    if args.source_lens_direction == "+x":
+    if effective_lens_direction == "+x":
         # Proper 180-degree rotation around Z: +X -> -X without mirroring.
         mesh.vertices[:, 0] *= -1.0
         mesh.vertices[:, 1] *= -1.0
@@ -166,6 +183,15 @@ def main() -> None:
     else:
         print(f"Warning: texture not found: {texture_path}")
 
+    if args.source_layout == "action4-export":
+        for map_name in ("normal", "roughness", "metallic"):
+            source_map = input_path.with_name(f"texture_{map_name}.png")
+            output_map = output_dir / f"{stem}_{map_name}.png"
+            if source_map.is_file():
+                backup_if_needed(output_map, stamp, backup_enabled)
+                shutil.copy2(source_map, output_map)
+                print(f"PBR map:     {output_map}")
+
     mins, maxs = mesh.bounds
     sizes = maxs - mins
     model_info = {
@@ -193,7 +219,8 @@ def main() -> None:
     print(f"Output size: {sizes.tolist()} mm")
     print(f"PLY:         {output_ply}")
     print(f"Model info:  {info_path}")
-    print(f"Source lens: {args.source_lens_direction}; output lens: -X")
+    print(f"Source layout: {args.source_layout}")
+    print(f"Mapped lens:  {effective_lens_direction}; output lens: -X")
 
 
 if __name__ == "__main__":

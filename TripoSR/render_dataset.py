@@ -1,18 +1,3 @@
-"""阶段二：为手戴运动相机的位姿估计渲染合成训练数据（BOP 格式）。
-
-基于 HCCEPose 的 s2_p1_gen_pbr_data.py 适配：
-- 场景：模拟 ego 视角（头戴相机俯视工作区）
-  * 桌面平铺随机材质（域随机化背景）
-  * 两个同款相机模型随机位姿（对应左右手）
-  * 可选简化前臂与腕带（默认关闭，正式遮挡数据需使用更真实资产）
-  * 相机在上方区域随机采样，俯视工作区
-- 输出：BOP 格式（RGB + 深度 + scene_gt.json 位姿标注）
-
-用法（在 dataset/demo-bin-picking 目录下运行）：
-  conda run -n render python ../../render_dataset.py 20 ../../../HCCEPose_src/cc0textures-512
-  （参数：渲染图片数 材质库路径）
-"""
-
 import os
 import json
 import argparse
@@ -20,8 +5,9 @@ import random
 import glob
 
 import numpy as np
-import blenderproc as bproc
 import bpy
+from PIL import Image, ImageEnhance, ImageFilter
+import blenderproc as bproc
 
 
 def axis_rotation(axis, angle):
@@ -34,37 +20,85 @@ def axis_rotation(axis, angle):
     return np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
 
 
-def wrist_camera_rotation(obj_location, camera_location, view_mode, rng):
+def wrist_camera_rotation(obj_location, camera_location, view_mode, rng, world_up=None):
     """Orient the model using the rear/side-heavy distribution in the real video."""
     to_camera = camera_location - obj_location
     to_camera /= np.linalg.norm(to_camera)
-
-    world_up = np.array([0.0, 0.0, 1.0])
+    if world_up is None:
+        world_up = np.array([0.0, 0.0, 1.0])
     if view_mode in {"front", "back"}:
-        # Lens/front normal is local -X; rear-screen normal is local +X.
         local_x_world = -to_camera if view_mode == "front" else to_camera
         local_z_world = world_up - np.dot(world_up, local_x_world) * local_x_world
         local_z_world /= np.linalg.norm(local_z_world)
         local_y_world = np.cross(local_z_world, local_x_world)
     else:
-        # Side normals are local +/-Y.
         local_y_world = to_camera if view_mode == "side_plus_y" else -to_camera
         local_z_world = world_up - np.dot(world_up, local_y_world) * local_y_world
         local_z_world /= np.linalg.norm(local_z_world)
         local_x_world = np.cross(local_y_world, local_z_world)
     base = np.column_stack((local_x_world, local_y_world, local_z_world))
 
-    perturbation = (
-        axis_rotation("x", rng.uniform(-0.22, 0.22))
-        @ axis_rotation("y", rng.uniform(-0.28, 0.28))
-        @ axis_rotation("z", rng.uniform(-0.42, 0.42))
-    )
+    if view_mode.startswith("side"):
+        perturbation = (
+            axis_rotation("x", rng.uniform(-0.14, 0.14))
+            @ axis_rotation("y", rng.uniform(-0.18, 0.18))
+            @ axis_rotation("z", rng.uniform(-0.28, 0.28))
+        )
+    else:
+        perturbation = (
+            axis_rotation("x", rng.uniform(-0.22, 0.22))
+            @ axis_rotation("y", rng.uniform(-0.28, 0.28))
+            @ axis_rotation("z", rng.uniform(-0.42, 0.42))
+        )
     return base @ perturbation
+
+
+def sample_composition(rng, lower_middle_probability):
+    """强制构图将双手压在画面底部边缘"""
+    # 让双手在桌面上左右更宽的范围内随机出现
+    group_x = rng.uniform(-0.25, 0.25)
+    aim_x = group_x + rng.uniform(-0.15, 0.15)
+
+    # 强制固定在 lower_middle 状态
+    # Y轴数值增大到 0.45-0.65 (让相机抬头看远处，从而把手压在底边)
+    return "lower_middle", group_x, np.array([
+        aim_x,
+        rng.uniform(0.45, 0.65),
+        rng.uniform(0.015, 0.045),
+    ])
 
 
 def set_local_pose(part, object_location, object_rotation, local_location):
     part.set_location(object_location + object_rotation @ np.asarray(local_location))
     part.set_rotation_mat(object_rotation)
+
+
+def attach_model_pbr_maps(obj, model_dir):
+    """Attach optional roughness, metallic, and normal maps beside the BOP PLY."""
+    material = obj.get_materials()[0].blender_obj
+    material.use_nodes = True
+    nodes = material.node_tree.nodes
+    links = material.node_tree.links
+    principled = next(node for node in nodes if node.type == "BSDF_PRINCIPLED")
+
+    for map_name, input_name in (("roughness", "Roughness"), ("metallic", "Metallic")):
+        path = os.path.join(model_dir, f"obj_000001_{map_name}.png")
+        if not os.path.isfile(path):
+            continue
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.image = bpy.data.images.load(path, check_existing=True)
+        texture.image.colorspace_settings.name = "Non-Color"
+        links.new(texture.outputs["Color"], principled.inputs[input_name])
+
+    normal_path = os.path.join(model_dir, "obj_000001_normal.png")
+    if os.path.isfile(normal_path):
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.image = bpy.data.images.load(normal_path, check_existing=True)
+        texture.image.colorspace_settings.name = "Non-Color"
+        normal_map = nodes.new("ShaderNodeNormalMap")
+        normal_map.inputs["Strength"].default_value = 0.55
+        links.new(texture.outputs["Color"], normal_map.inputs["Color"])
+        links.new(normal_map.outputs["Normal"], principled.inputs["Normal"])
 
 
 def create_segment(start, end, radius, material):
@@ -83,64 +117,157 @@ def create_segment(start, end, radius, material):
                                             location=(start + end) / 2.0)
     segment.set_rotation_mat(np.column_stack((x_axis, y_axis, z_axis)))
     segment.replace_materials(material)
+    segment.set_shading_mode("smooth")
     return segment
 
 
-def add_wrist_context(wrist, camera_rotation, skin_material, strap_material,
+def rotation_from_z_axis(z_axis):
+    """Return an orthonormal frame whose local Z axis follows z_axis."""
+    z_axis = np.asarray(z_axis, dtype=float)
+    z_axis /= np.linalg.norm(z_axis)
+    helper = np.array([0.0, 0.0, 1.0]) if abs(z_axis[2]) < 0.9 else np.array([0.0, 1.0, 0.0])
+    x_axis = np.cross(helper, z_axis)
+    x_axis /= np.linalg.norm(x_axis)
+    return np.column_stack((x_axis, np.cross(z_axis, x_axis), z_axis))
+
+
+def add_wrist_context(wrist, elbow, mount, axis, arm_radius, band_radius,
+                      cam_center, camera_rotation, skin_material, strap_material,
                       cable_material, rng):
-    """Build a wrist/hand proxy whose geometry is tied to one camera wrist."""
+    """Build a smooth first-person forearm anchored to a wrist camera."""
     wrist = np.asarray(wrist, dtype=float)
     context = []
-    # Forearm points away from the camera wrist toward the lower image area.
-    forearm_end = wrist + np.array([rng.uniform(-0.015, 0.015), -0.16,
-                                    rng.uniform(-0.005, 0.008)])
-    arm = bproc.object.create_primitive("SPHERE", scale=[0.035, 0.145, 0.024],
-                                        location=(wrist + forearm_end) / 2.0)
-    arm.set_rotation_euler([rng.uniform(-0.08, 0.08), rng.uniform(-0.10, 0.10),
-                            rng.uniform(-0.12, 0.12)])
-    arm.replace_materials(skin_material)
-    context.append(arm)
+    arm = create_segment(wrist, elbow, arm_radius, skin_material)
+    if arm is not None:
+        context.append(arm)
+    for point, radius in ((wrist, arm_radius * 0.96), (elbow, arm_radius * 1.02)):
+        cap = bproc.object.create_primitive("SPHERE", scale=[radius] * 3, location=point)
+        cap.replace_materials(skin_material)
+        cap.set_shading_mode("smooth")
+        context.append(cap)
 
-    # Keep the palm below and slightly behind the camera so the camera body
-    # remains visible, as in the target wrist-mounted footage.
-    palm = bproc.object.create_primitive("SPHERE", scale=[0.040, 0.035, 0.017],
-                                         location=wrist + np.array([0.0, -0.018, -0.020]))
-    palm.set_rotation_mat(camera_rotation)
+    band_width = rng.uniform(0.030, 0.040)
+    band = create_segment(mount - axis * band_width * 0.5,
+                          mount + axis * band_width * 0.5,
+                          band_radius, strap_material)
+    if band is not None:
+        context.append(band)
+
+    hand_direction = wrist - mount
+    hand_direction /= np.linalg.norm(hand_direction)
+    palm_center = wrist + hand_direction * rng.uniform(0.030, 0.045)
+    palm = bproc.object.create_primitive("SPHERE", scale=[0.034, 0.020, 0.055],
+                                         location=palm_center)
+    hand_rotation = rotation_from_z_axis(hand_direction)
+    palm.set_rotation_mat(hand_rotation)
     palm.replace_materials(skin_material)
+    palm.set_shading_mode("smooth")
     context.append(palm)
 
-    # A dark strap wraps the wrist close to the target camera.
-    strap = bproc.object.create_primitive("CUBE", scale=[0.050, 0.036, 0.006],
-                                          location=wrist + np.array([0.0, 0.010, -0.012]))
-    strap.set_rotation_mat(camera_rotation)
-    strap.replace_materials(strap_material)
-    context.append(strap)
-
-    # Two to four short finger capsules cross the camera body from the palm.
-    finger_count = rng.randint(2, 3)
+    finger_count = rng.randint(3, 4)
     for finger_index in range(finger_count):
-        lateral = (finger_index - (finger_count - 1) / 2.0) * 0.014
-        start = wrist + np.array([lateral, -0.028, -0.002 + rng.uniform(-0.004, 0.004)])
-        end = start + np.array([rng.uniform(-0.010, 0.010), rng.uniform(0.025, 0.050),
-                                rng.uniform(0.000, 0.008)])
-        finger = create_segment(start, end, rng.uniform(0.0055, 0.008), skin_material)
+        lateral = (finger_index - (finger_count - 1) / 2.0) * 0.011
+        start = palm_center + hand_direction * 0.038 + hand_rotation[:, 0] * lateral
+        end = start + hand_direction * rng.uniform(0.028, 0.050)
+        finger = create_segment(start, end, rng.uniform(0.0055, 0.007), skin_material)
         if finger is not None:
             context.append(finger)
-            for point in (start, end):
-                tip = bproc.object.create_primitive("SPHERE", scale=[0.0065, 0.0065, 0.0065],
-                                                    location=point)
-                tip.replace_materials(skin_material)
-                context.append(tip)
 
-    # Thin cable exiting the side of the camera toward the forearm.
-    cable_start = wrist + camera_rotation @ np.array([0.0, 0.028, -0.005])
-    cable_mid = wrist + np.array([rng.uniform(-0.01, 0.01), -0.055, -0.005])
-    cable_end = forearm_end + np.array([rng.uniform(-0.01, 0.01), 0.035, 0.0])
+
+    cable_start = cam_center + camera_rotation @ np.array([0.0, 0.030, -0.004])
+    cable_mid = mount + np.array([rng.uniform(-0.012, 0.012), 0.015,
+                                  -(arm_radius + 0.008)])
+    cable_end = elbow + np.array([rng.uniform(-0.01, 0.01), 0.03, 0.0])
     for a, b in ((cable_start, cable_mid), (cable_mid, cable_end)):
         cable = create_segment(a, b, 0.0022, cable_material)
         if cable is not None:
             context.append(cable)
     return context
+
+
+def create_target_scene(grid_material, denim_material, metal_material, pants_material):
+    """Create the stable white grid, scalable denim jacket, and pants context."""
+    scene_objects = []
+    # 桌面网格
+    for value in np.arange(-0.55, 0.56, 0.055):
+        vertical = bproc.object.create_primitive(
+            "CUBE", scale=[0.0008, 0.60, 0.00035], location=[value, 0.25, 0.001])
+        horizontal = bproc.object.create_primitive(
+            "CUBE", scale=[0.55, 0.0008, 0.00035], location=[0.0, value + 0.25, 0.001])
+        vertical.replace_materials(grid_material)
+        horizontal.replace_materials(grid_material)
+        scene_objects.extend([vertical, horizontal])
+
+    garment_objects = []
+
+    # === 衣服全局缩放系数 (1.0为默认大小，这里设置为 1.3 放大) ===
+    g_scale = 1.3
+    base_y = 0.34  # 衣服在桌面上的中心 Y 坐标基准点
+
+    # 1. 缩放躯干
+    for x_offset, scale in ((0.0, [0.14, 0.17, 0.018]),
+                            (-0.07, [0.09, 0.15, 0.014]),
+                            (0.07, [0.09, 0.15, 0.014])):
+        torso = bproc.object.create_primitive(
+            "SPHERE",
+            scale=[scale[0] * g_scale, scale[1] * g_scale, scale[2]],
+            location=[x_offset * g_scale, base_y, 0.015]
+        )
+        torso.replace_materials(denim_material)
+        torso.set_shading_mode("smooth")
+        garment_objects.append(torso)
+
+    # 2. 缩放袖子和金属扣
+    for side in (-1.0, 1.0):
+        sleeve = create_segment(
+            [side * 0.12 * g_scale, base_y + 0.04 * g_scale, 0.018],
+            [side * 0.34 * g_scale, base_y + 0.08 * g_scale, 0.018],
+            0.048 * g_scale, denim_material
+        )
+        if sleeve is not None:
+            garment_objects.append(sleeve)
+
+        for button_y_offset in (-0.10, -0.01, 0.08):
+            button = bproc.object.create_primitive(
+                "CYLINDER",
+                scale=[0.007 * g_scale, 0.007 * g_scale, 0.003],
+                location=[side * 0.025 * g_scale, base_y + button_y_offset * g_scale, 0.025]
+            )
+            button.replace_materials(metal_material)
+            garment_objects.append(button)
+
+    # 3. 在桌缘下方生成黑色裤腿
+    for side in (-1.0, 1.0):
+        leg = create_segment(
+            # 起点：向后方（Y=-0.80）和下方（Z=-0.65）大幅延伸，模拟长腿
+            [side * 0.18, -0.80, -0.65],
+            # 终点：贴近桌子边缘
+            [side * 0.18, -0.02, -0.10],
+            # 粗细：半径从 0.14 增加到 0.22，让裤腿更宽大
+            0.22, pants_material
+        )
+        if leg is not None:
+            garment_objects.append(leg)
+
+    return scene_objects, garment_objects
+
+
+def uint8_color(color):
+    pixels = np.asarray(color)
+    if np.issubdtype(pixels.dtype, np.floating) and pixels.max(initial=0.0) <= 1.0:
+        pixels = pixels * 255.0
+    return np.clip(pixels, 0, 255).astype(np.uint8)
+
+
+def process_color(color, rng):
+    """Approximate the muted exposure and softness of the target video."""
+    image = Image.fromarray(uint8_color(color), mode="RGB")
+    image = ImageEnhance.Brightness(image).enhance(rng.uniform(0.52, 0.68))
+    image = ImageEnhance.Contrast(image).enhance(rng.uniform(1.05, 1.22))
+    image = ImageEnhance.Color(image).enhance(rng.uniform(1.00, 1.18))
+    if rng.random() < 0.55:
+        image = image.filter(ImageFilter.GaussianBlur(radius=rng.uniform(0.25, 0.65)))
+    return np.asarray(image)
 
 
 def place_on_surface(location, rotation, clearance=0.003):
@@ -161,62 +288,85 @@ def place_on_surface(location, rotation, clearance=0.003):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("num_images", type=int, help="渲染图片数量")
-    parser.add_argument("cc0textures", type=str, help="cc0textures-512 材质库路径")
+    parser.add_argument("cc0textures", type=str, nargs="?", default=None,
+                        help="generic 场景所需的 cc0textures-512 材质库路径")
     parser.add_argument("--width", type=int, default=960)
     parser.add_argument("--height", type=int, default=720)
+    parser.add_argument("--dataset-dir", type=str, default=None,
+                        help="BOP 数据集根目录；默认使用当前工作目录")
     parser.add_argument("--fov", type=float, default=82.0, help="水平视场角(度)")
     parser.add_argument("--seed", type=int, default=7, help="随机种子")
     parser.add_argument("--arms", action=argparse.BooleanOptionalAction, default=True,
                         help="生成与左右腕绑定的前臂、手掌、手指、腕带和线缆（默认开启）")
-    parser.add_argument("--front-probability", type=float, default=0.20,
+    parser.add_argument("--front-probability", type=float, default=0.10,
                         help="正面视角概率")
-    parser.add_argument("--back-probability", type=float, default=0.20,
-                        help="背面视角概率；侧面 = 1 - 正面 - 背面，均分给左右两个侧面。"
-                             "默认 0.20/0.20/0.60 即 背:正:侧 = 1:1:3")
-    parser.add_argument("--occlusion-probability", type=float, default=0.55,
+    parser.add_argument("--back-probability", type=float, default=0.10,
+                        help="背面视角概率；侧面 = 1 - 正面 - 背面")
+    parser.add_argument("--lower-middle-probability", type=float, default=0.70,
+                        help="保留用于命令兼容；当前构图固定在下方中间区域")
+    parser.add_argument("--occlusion-probability", type=float, default=0.20,
                         help="每个实例出现遮挡的总概率；遮挡内部再随机轻/中/重等级")
     parser.add_argument("--samples", type=int, default=8, help="Cycles 每像素采样数")
+    parser.add_argument("--scene-profile", choices=("target", "generic"), default="target",
+                        help="target 匹配 frames 中的室内腕戴场景；generic 使用 CC0 地面")
+    parser.add_argument("--garment-probability", type=float, default=1.0,
+                        help="target 场景中出现蓝色衣物上下文的概率（默认 1.0，保证常驻）")
+    parser.add_argument("--sensor-effects", action=argparse.BooleanOptionalAction, default=True,
+                        help="对 target RGB 应用接近测试视频的曝光、饱和度、模糊和 JPEG 退化")
+    parser.add_argument("--rear-screen-proxy", action=argparse.BooleanOptionalAction, default=False,
+                        help="为缺少背屏的旧模型添加背屏代理；新模型默认不需要")
+    parser.add_argument("--preview-dir", type=str, default=None,
+                        help="仅保存 RGB 样图到此目录，不追加或改写 BOP 数据集")
     parser.add_argument("--bop-masks", action="store_true",
                         help="额外生成 BOP mask/info/COCO（较慢，macOS 使用单进程）")
     args = parser.parse_args()
-    if args.front_probability + args.back_probability > 1.0:
-        parser.error("--front-probability 与 --back-probability 之和不能超过 1.0")
 
-    current_dir = os.path.abspath(os.getcwd())
+    current_dir = os.path.abspath(args.dataset_dir or os.getcwd())
     dataset_name = os.path.basename(current_dir)
     bop_parent_path = os.path.dirname(current_dir)
     bop_dataset_path = os.path.join(bop_parent_path, dataset_name)
-    args.cc0textures = os.path.abspath(args.cc0textures)
+    preview_dir = os.path.abspath(args.preview_dir) if args.preview_dir else None
 
-    # 相机内参（与真实视频 3248x2464 的 4:3 比例一致）
     W, H = args.width, args.height
     fx = fy = W / (2.0 * np.tan(np.deg2rad(args.fov) / 2.0))
     cam_json = os.path.join(current_dir, "camera.json")
-    with open(cam_json, "w") as f:
-        json.dump({"cx": W / 2.0, "cy": H / 2.0, "depth_scale": 0.1,
-                  "fx": fx, "fy": fy, "height": H, "width": W}, f, indent=2)
+    if not preview_dir:
+        with open(cam_json, "w") as f:
+            json.dump({"cx": W / 2.0, "cy": H / 2.0, "depth_scale": 0.1,
+                      "fx": fx, "fy": fy, "height": H, "width": W}, f, indent=2)
 
     bproc.init()
 
-    # 加载全部背景材质（512 精简版，扁平命名）
-    if os.path.basename(args.cc0textures) == "cc0textures-512":
-        cc_textures = bproc.loader.load_512_ccmaterials(args.cc0textures, use_all_materials=True)
+    cc_textures = []
+    if args.scene_profile == "generic":
+        if os.path.basename(args.cc0textures) == "cc0textures-512":
+            cc_textures = bproc.loader.load_512_ccmaterials(args.cc0textures, use_all_materials=True)
+        else:
+            cc_textures = bproc.loader.load_ccmaterials(args.cc0textures, use_all_materials=True)
+
+    if preview_dir:
+        intrinsic_matrix = np.array([[fx, 0.0, W / 2.0],
+                                     [0.0, fy, H / 2.0],
+                                     [0.0, 0.0, 1.0]])
+        bproc.camera.set_intrinsics_from_K_matrix(intrinsic_matrix, W, H)
     else:
-        cc_textures = bproc.loader.load_ccmaterials(args.cc0textures, use_all_materials=True)
-    print(f"已加载 {len(cc_textures)} 种背景材质")
+        bproc.loader.load_bop_intrinsics(bop_dataset_path=bop_dataset_path)
 
-    bproc.loader.load_bop_intrinsics(bop_dataset_path=bop_dataset_path)
-
-    # 大面积工作台保证宽视角下不会露出虚拟世界背景。
-    table = bproc.object.create_primitive("PLANE", scale=[1.5, 1.5, 1.0], location=[0, 0, 0])
+    table = bproc.object.create_primitive("PLANE", scale=[2.0, 2.0, 1.0], location=[0, 0, 0])
     table.set_name("table")
+    table_material = bproc.material.create("target_table")
+    table_material.set_principled_shader_value("Base Color", [0.58, 0.61, 0.63, 1.0])
+    table_material.set_principled_shader_value("Roughness", 0.92)
+    table.replace_materials(table_material)
 
-    # 环境光：顶部面光 + 点光源（渲染时随机化）
-    light_plane = bproc.object.create_primitive("PLANE", scale=[0.5, 0.5, 1.0], location=[0, 0, 1.2])
-    light_plane.set_name("light_plane")
-    light_plane_material = bproc.material.create("light_material")
-    light_point = bproc.types.Light()
-    light_point.set_energy(80)
+    area_lights = []
+    for lx, ly in ((-0.55, -0.10), (0.55, -0.10), (-0.35, 0.50), (0.35, 0.50)):
+        light = bproc.types.Light(light_type="AREA")
+        light.set_location([lx, ly, 1.15])
+        light.blender_obj.data.size = 0.75
+        light.set_energy(18)
+        area_lights.append(light)
+    bproc.renderer.set_world_background([0.14, 0.15, 0.16], strength=0.8)
 
     skin_material = bproc.material.create("forearm_skin")
     skin_material.set_principled_shader_value("Base Color", [0.34, 0.16, 0.08, 1.0])
@@ -234,11 +384,32 @@ def main():
     display_material.set_principled_shader_value("Base Color", [0.025, 0.045, 0.052, 1.0])
     display_material.set_principled_shader_value("Roughness", 0.18)
 
+    garment_objects = []
+    if args.scene_profile == "target":
+        grid_material = bproc.material.create("work_surface_grid")
+        grid_material.set_principled_shader_value("Base Color", [0.075, 0.085, 0.090, 1.0])
+        grid_material.set_principled_shader_value("Roughness", 0.88)
+        denim_material = bproc.material.create("denim_garment")
+        denim_material.set_principled_shader_value("Base Color", [0.075, 0.13, 0.20, 1.0])
+        denim_material.set_principled_shader_value("Roughness", 0.96)
+        metal_material = bproc.material.create("garment_buttons")
+        metal_material.set_principled_shader_value("Base Color", [0.52, 0.52, 0.48, 1.0])
+        metal_material.set_principled_shader_value("Metallic", 0.6)
+        metal_material.set_principled_shader_value("Roughness", 0.42)
+
+        pants_material = bproc.material.create("pants_fabric")
+        pants_material.set_principled_shader_value("Base Color", [0.012, 0.012, 0.015, 1.0])
+        pants_material.set_principled_shader_value("Roughness", 0.95)
+
+        _, garment_objects = create_target_scene(grid_material, denim_material, metal_material, pants_material)
+
     bproc.renderer.enable_depth_output(activate_antialiasing=False)
     bproc.renderer.set_max_amount_of_samples(args.samples)
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
+    if preview_dir:
+        os.makedirs(preview_dir, exist_ok=True)
     metadata_path = os.path.join(current_dir, "train_pbr", "scene_metadata.json")
     scene_metadata = {}
     if os.path.exists(metadata_path):
@@ -247,55 +418,73 @@ def main():
     existing_rgb = glob.glob(os.path.join(current_dir, "train_pbr", "*", "rgb", "*.jpg"))
     metadata_start_id = len(existing_rgb)
 
-    # Load the two target instances once. Reusing them avoids stale entries in
-    # BlenderProc's BOP object cache after the first frame.
     objs = bproc.loader.load_bop_objs(bop_dataset_path=bop_dataset_path, mm2m=True, obj_ids=[1])
     assert len(objs) == 1
     objs += bproc.loader.load_bop_objs(bop_dataset_path=bop_dataset_path, mm2m=True, obj_ids=[1])
     for obj in objs:
         obj.set_shading_mode("auto")
+        attach_model_pbr_maps(obj, os.path.join(bop_dataset_path, "models"))
 
-    # The source image does not show the rear screen. Add a conservative proxy
-    # at local +X so rear/oblique views resemble the physical camera.
     rear_parts = []
     for _ in objs:
-        bezel = bproc.object.create_primitive("CUBE", scale=[0.0010, 0.0310, 0.0188])
-        bezel.replace_materials(bezel_material)
-        display = bproc.object.create_primitive("CUBE", scale=[0.0006, 0.0287, 0.0165])
-        display.replace_materials(display_material)
+        bezel = display = None
+        if args.rear_screen_proxy:
+            bezel = bproc.object.create_primitive("CUBE", scale=[0.0010, 0.0310, 0.0188])
+            bezel.replace_materials(bezel_material)
+            display = bproc.object.create_primitive("CUBE", scale=[0.0006, 0.0287, 0.0165])
+            display.replace_materials(display_material)
         rear_parts.append((bezel, display))
 
     for img_idx in range(args.num_images):
-        # ---- 背景 + 光照随机化 ----
-        random_cc_texture = np.random.choice(cc_textures)
-        table.replace_materials(random_cc_texture)
-        # Vary skin tone and roughness to avoid overfitting to one synthetic hand.
+        if args.scene_profile == "generic":
+            table.replace_materials(np.random.choice(cc_textures))
+        else:
+            table.replace_materials(table_material)
+            neutral = rng.uniform(0.52, 0.66)
+            table_material.set_principled_shader_value(
+                "Base Color", [neutral * rng.uniform(0.94, 1.01),
+                               neutral * rng.uniform(0.97, 1.02),
+                               neutral * rng.uniform(1.00, 1.06), 1.0])
+            show_garment = rng.random() < args.garment_probability
+            for garment_object in garment_objects:
+                garment_object.hide(not show_garment)
+
         skin_material.set_principled_shader_value(
             "Base Color", [float(np.random.uniform(0.28, 0.48)),
                            float(np.random.uniform(0.12, 0.25)),
                            float(np.random.uniform(0.07, 0.16)), 1.0])
         skin_material.set_principled_shader_value("Roughness", np.random.uniform(0.52, 0.78))
-        light_plane_material.make_emissive(
-            emission_strength=np.random.uniform(0.8, 2.0),
-            emission_color=np.random.uniform([0.65, 0.65, 0.65, 1.0], [1.0, 1.0, 1.0, 1.0]))
-        light_plane.replace_materials(light_plane_material)
-        light_point.set_color(np.random.uniform([0.5, 0.5, 0.5], [1, 1, 1]))
-        light_point.set_location(np.random.uniform([-0.3, -0.3, 0.5], [0.3, 0.3, 0.8]))
+        for light in area_lights:
+            light.set_energy(rng.uniform(13.0, 24.0))
+            light.set_color([rng.uniform(0.88, 1.0), rng.uniform(0.90, 1.0), 1.0])
 
-        # ---- 头戴相机与左右手腕的绑定空间关系 ----
-        target = np.array([0.0, 0.01, rng.uniform(0.115, 0.165)])
+        composition_band, group_x, target = sample_composition(
+            rng, args.lower_middle_probability)
         cam_loc = np.array([rng.uniform(-0.035, 0.035),
-                            rng.uniform(-0.20, -0.14),
-                            rng.uniform(0.25, 0.38)])
+                            rng.uniform(-0.43, -0.20),
+                            rng.uniform(0.40, 0.72)])
 
-        x_spread = rng.uniform(0.068, 0.092)
+        left_spread = rng.uniform(0.085, 0.160)
+        right_spread = rng.uniform(0.085, 0.160)
         wrist_centers = [
-            np.array([-x_spread, rng.uniform(-0.005, 0.025), rng.uniform(0.073, 0.090)]),
-            np.array([ x_spread, rng.uniform(-0.005, 0.025), rng.uniform(0.073, 0.090)]),
+            np.array([group_x - left_spread, rng.uniform(0.015, 0.17),
+                      rng.uniform(0.050, 0.090)]),
+            np.array([group_x + right_spread, rng.uniform(0.015, 0.17),
+                      rng.uniform(0.050, 0.090)]),
         ]
-        # The camera is mounted just above each wrist, with small mount noise.
-        placed = [w + np.array([rng.uniform(-0.006, 0.006), rng.uniform(-0.006, 0.006),
-                                 rng.uniform(0.025, 0.035)]) for w in wrist_centers]
+        arm_info = []
+        for wrist, side in zip(wrist_centers, (-1.0, 1.0)):
+            elbow = cam_loc + np.array([side * rng.uniform(0.10, 0.17),
+                                        rng.uniform(-0.20, -0.11),
+                                        rng.uniform(-0.34, -0.25)])
+            axis = elbow - wrist
+            axis /= np.linalg.norm(axis)
+            mount = wrist + axis * rng.uniform(0.060, 0.100)
+            arm_radius = rng.uniform(0.035, 0.043)
+            arm_info.append({"wrist": wrist, "elbow": elbow, "axis": axis,
+                             "mount": mount, "arm_radius": arm_radius,
+                             "band_radius": arm_radius + rng.uniform(0.006, 0.010)})
+        placed = [info["mount"].copy() for info in arm_info]
         for obj in objs:
             mat = obj.get_materials()[0]
             mat.set_principled_shader_value("Roughness", np.random.uniform(0.2, 0.9))
@@ -308,25 +497,54 @@ def main():
                          side_probability * 0.5, side_probability * 0.5], k=1)[0]
             rotation_obj = wrist_camera_rotation(
                 loc, cam_loc, view_mode=view_mode, rng=rng)
-            if not args.arms:
+            if args.arms:
+                info = arm_info[index]
+
+                # 1. 计算出手臂 12点钟方向 的基准法向量
+                base_normal = np.array([0.0, 0.0, 1.0])
+                base_normal -= np.dot(base_normal, info["axis"]) * info["axis"]
+                base_normal /= np.linalg.norm(base_normal)
+
+                # 2. 计算出 3点钟方向 的侧面法向量
+                side_normal = np.cross(info["axis"], base_normal)
+
+                # 3. 引入佩戴角度的随机化 (-2.6 到 2.6 弧度，约等于 -150度 到 150度)
+                # 这会让相机在手臂的一大半圆周表面上随机出现
+                roll = rng.uniform(-1.0, 1.0)
+
+                # 4. 根据随机角度合成最终的表面法向量
+                normal = np.cos(roll) * base_normal + np.sin(roll) * side_normal
+                normal /= np.linalg.norm(normal)
+
+                # 5. 更新相机的位置，使其贴在手臂的表面
+                loc = loc + normal * (info["band_radius"] + 0.026)
+                placed[index] = loc
+                info["cam_center"] = loc
+
+                # 6. 生成旋转矩阵（关键：传入 normal 作为相机的 Up 向量，让相机跟着手臂一起侧翻）
+                rotation_obj = wrist_camera_rotation(loc, cam_loc, view_mode, rng, world_up=normal)
+            else:
+                rotation_obj = wrist_camera_rotation(loc, cam_loc, view_mode, rng)
                 loc = place_on_surface(loc, rotation_obj)
                 placed[index] = loc
             obj.set_location(loc)
             obj.set_rotation_mat(rotation_obj)
             bezel, display = rear_parts[index]
-            set_local_pose(bezel, loc, rotation_obj, [0.0153, 0.0, 0.0])
-            set_local_pose(display, loc, rotation_obj, [0.0160, 0.0, 0.0])
+            if bezel is not None:
+                set_local_pose(bezel, loc, rotation_obj, [0.0153, 0.0, 0.0])
+                set_local_pose(display, loc, rotation_obj, [0.0160, 0.0, 0.0])
             instance_poses.append((loc, rotation_obj, view_mode))
 
-        # ---- 简化前臂与腕带；仅作上下文/遮挡，不写入目标标注 ----
         context_objects = []
         if args.arms:
-            for wrist, (_, rotation_obj, _) in zip(wrist_centers, instance_poses):
+            for info, (_, rotation_obj, _) in zip(arm_info, instance_poses):
                 context_objects.extend(add_wrist_context(
-                    wrist, rotation_obj, skin_material, strap_material,
-                    cable_material, rng))
+                    info["wrist"], info["elbow"], info["mount"], info["axis"],
+                    info["arm_radius"], info["band_radius"], info["cam_center"],
+                    rotation_obj, skin_material, strap_material, cable_material, rng))
 
-        # Partial foreground occlusion resembling a finger crossing the body.
+        occlusion_levels = ["none"] * len(instance_poses)
+        """
         occlusion_levels = []
         for loc, _, _ in instance_poses:
             is_occluded = rng.random() < args.occlusion_probability
@@ -365,38 +583,52 @@ def main():
                                     + vertical * rng.uniform(-0.012, 0.012))
                 finger.replace_materials(skin_material)
                 context_objects.append(finger)
-
-        # ---- ego 相机位姿：上方俯视 ----
-        rotation = bproc.camera.rotation_from_forward_vec(target - cam_loc,
-                                                         inplane_rot=rng.uniform(-0.12, 0.12))
+            """
+        # ---- ego 相机位姿：上方俯视 + 随机偏头视线噪声 ----
+        look_noise = np.array([
+            rng.uniform(-0.35, 0.35),  # 左右随机偏头 (Pan offset)
+            rng.uniform(-0.5, 0.25),  # 上下随机抬头/俯视 (Tilt offset)
+            0.0
+        ])
+        rotation = bproc.camera.rotation_from_forward_vec(
+            (target + look_noise) - cam_loc,
+            inplane_rot=rng.uniform(-0.12, 0.12)
+        )
         cam2world = bproc.math.build_transformation_mat(cam_loc, rotation)
-        # Each loop builds and renders one independent scene. Reuse frame 0 so
-        # previously added camera keyframes are not rendered again.
         bproc.camera.add_camera_pose(cam2world, frame=0)
 
-        # ---- 渲染并写 BOP ----
         data = bproc.renderer.render()
-        bproc.writer.write_bop(
-            output_dir=bop_parent_path,
-            target_objects=objs,
-            dataset=dataset_name,
-            depth_scale=0.1,
-            depths=data["depth"],
-            colors=data["colors"],
-            color_file_format="JPEG",
-            ignore_dist_thres=10,
-            append_to_existing_output=True,
-            calc_mask_info_coco=args.bop_masks,
-            num_worker=0,
-        )
-        scene_metadata[str(metadata_start_id + img_idx)] = {
-            "view_modes": [pose[2] for pose in instance_poses],
-            "occlusion_levels": occlusion_levels,
-        }
-        with open(metadata_path, "w") as f:
-            json.dump(scene_metadata, f, indent=2)
+        if preview_dir:
+            preview_color = (process_color(data["colors"][0], rng)
+                             if args.sensor_effects and args.scene_profile == "target"
+                             else uint8_color(data["colors"][0]))
+            Image.fromarray(preview_color, mode="RGB").save(
+                os.path.join(preview_dir, f"{img_idx:06d}.jpg"), quality=88, subsampling=2)
+        else:
+            colors = ([process_color(color, rng) for color in data["colors"]]
+                      if args.sensor_effects and args.scene_profile == "target" else data["colors"])
+            bproc.writer.write_bop(
+                output_dir=bop_parent_path,
+                target_objects=objs,
+                dataset=dataset_name,
+                depth_scale=0.1,
+                depths=data["depth"],
+                colors=colors,
+                color_file_format="JPEG",
+                ignore_dist_thres=10,
+                append_to_existing_output=True,
+                calc_mask_info_coco=args.bop_masks,
+                num_worker=0,
+            )
+            scene_metadata[str(metadata_start_id + img_idx)] = {
+                "view_modes": [pose[2] for pose in instance_poses],
+                "occlusion_levels": occlusion_levels,
+                "scene_profile": args.scene_profile,
+                "composition_band": composition_band,
+            }
+            with open(metadata_path, "w") as f:
+                json.dump(scene_metadata, f, indent=2)
 
-        # 清理物体，下一张图重新布置
         for context_obj in context_objects:
             bpy.data.objects.remove(context_obj.blender_obj, do_unlink=True)
 
