@@ -189,11 +189,15 @@ def create_target_scene(grid_material, denim_material, metal_material, pants_mat
     """Create the stable white grid, scalable denim jacket, and pants context."""
     scene_objects = []
     # 桌面网格
-    for value in np.arange(-0.55, 0.56, 0.055):
+    for value in np.arange(-0.45, 0.46, 0.035):
+        # 纵向线条：按新桌子的 Y 轴比例缩短长度 (scale 的第二个值改为 0.35)
         vertical = bproc.object.create_primitive(
-            "CUBE", scale=[0.0008, 0.60, 0.00035], location=[value, 0.25, 0.001])
+            "CUBE", scale=[0.0008, 0.35, 0.00035], location=[value, 0.1, 0.001])
+            
+        # 横向线条：按新桌子的 X 轴比例缩短长度 (scale 的第一个值改为 0.45)
         horizontal = bproc.object.create_primitive(
-            "CUBE", scale=[0.55, 0.0008, 0.00035], location=[0.0, value + 0.25, 0.001])
+            "CUBE", scale=[0.45, 0.0008, 0.00035], location=[0.0, value + 0.1, 0.001])
+            
         vertical.replace_materials(grid_material)
         horizontal.replace_materials(grid_material)
         scene_objects.extend([vertical, horizontal])
@@ -236,13 +240,13 @@ def create_target_scene(grid_material, denim_material, metal_material, pants_mat
             button.replace_materials(metal_material)
             garment_objects.append(button)
 
-    # 3. 在桌缘下方生成黑色裤腿
+    # 3. 在相机下方生成黑色裤腿，让低位相机遇到真实的暗色背景
     for side in [-0.08, 0.08]: # 稍微拉开一点左右腿间距
         leg = bproc.object.create_primitive(
             "CUBE", # 【关键修改】改为立方体
             # X(宽度) 给够，Y(厚度) 稍微压扁模拟被裤子包裹的平整感，Z(长度) 拉长
-            scale=[0.14, 0.08, 0.35], 
-            location=[side, -0.35, -0.4]
+            scale=[0.14, 0.08, 0.35],
+            location=[side, -0.22, -0.12]
         )
         # 将长方体放倒并让膝盖朝上倾斜
         leg.set_rotation_euler([np.pi/2 - 0.3, 0, 0])
@@ -252,15 +256,15 @@ def create_target_scene(grid_material, denim_material, metal_material, pants_mat
 
     # === 1. 模拟操作者位于相机下方的大腿/膝盖 ===
     pants_material = bproc.material.create("black_pants")
-    pants_material.set_principled_shader_value("Base Color", [0.02, 0.02, 0.02, 1.0])
-    pants_material.set_principled_shader_value("Roughness", 0.95)
+    pants_material.set_principled_shader_value("Base Color", [0.025, 0.027, 0.030, 1.0])
+    pants_material.set_principled_shader_value("Roughness", 0.84)
     
-    # 用两个向斜下方倾斜的圆柱体模拟双腿，位置大幅下压 (Z=-0.4)，稍微后退 (Y=-0.35)
+    # 用两个向斜下方倾斜的圆柱体模拟双腿，放在相机后下方形成暗色干扰
     for side in [-0.15, 0.15]: # 左右腿间距
         leg = bproc.object.create_primitive(
             "CYLINDER", 
-            scale=[0.12, 0.12, 0.3], 
-            location=[side, -0.35, -0.4]
+            scale=[0.12, 0.12, 0.3],
+            location=[side, -0.22, -0.12]
         )
         # 将圆柱体放倒并让膝盖朝上倾斜
         leg.set_rotation_euler([np.pi/2 - 0.3, 0, 0])
@@ -336,6 +340,14 @@ def process_color(color, rng):
     return np.asarray(image)
 
 
+def jitter_reference_color(color, rng, scale_range=(0.86, 1.14), channel_range=(0.94, 1.06)):
+    """Apply restrained RGB variation without changing the material identity."""
+    reference = np.asarray(color, dtype=np.float64)[:3]
+    scale = rng.uniform(*scale_range)
+    channels = np.asarray([rng.uniform(*channel_range) for _ in range(3)])
+    return np.concatenate((np.clip(reference * scale * channels, 0.0, 1.0), [1.0]))
+
+
 def place_on_surface(location, rotation, clearance=0.003):
     """Set Z so the rotated metric bounding box rests above the table."""
     half_extents = np.array([0.0164, 0.03525, 0.0221])
@@ -375,7 +387,7 @@ def main():
     parser.add_argument("--samples", type=int, default=8, help="Cycles 每像素采样数")
     parser.add_argument("--scene-profile", choices=("target", "generic"), default="target",
                         help="target 匹配 frames 中的室内腕戴场景；generic 使用 CC0 地面")
-    parser.add_argument("--garment-probability", type=float, default=1.0,
+    parser.add_argument("--garment-probability", type=float, default=0.8,
                         help="target 场景中出现蓝色衣物上下文的概率（默认 1.0，保证常驻）")
     parser.add_argument("--sensor-effects", action=argparse.BooleanOptionalAction, default=True,
                         help="对 target RGB 应用接近测试视频的曝光、饱和度、模糊和 JPEG 退化")
@@ -418,7 +430,7 @@ def main():
     else:
         bproc.loader.load_bop_intrinsics(bop_dataset_path=bop_dataset_path)
 
-    table = bproc.object.create_primitive("PLANE", scale=[0.65, 0.55, 1.0], location=[0, 0.1, 0])
+    table = bproc.object.create_primitive("PLANE", scale=[0.45, 0.35, 1.0], location=[0, 0.1, 0])
     table.set_name("table")
     table_material = bproc.material.create("target_table")
     table_material.set_principled_shader_value("Base Color", [0.58, 0.61, 0.63, 1.0])
@@ -453,8 +465,8 @@ def main():
     garment_objects = []
     if args.scene_profile == "target":
         grid_material = bproc.material.create("work_surface_grid")
-        grid_material.set_principled_shader_value("Base Color", [0.075, 0.085, 0.090, 1.0])
-        grid_material.set_principled_shader_value("Roughness", 0.88)
+        grid_material.set_principled_shader_value("Base Color", [0.005, 0.005, 0.005, 1.0])
+        grid_material.set_principled_shader_value("Roughness", 1.00)
         denim_material = bproc.material.create("denim_garment")
         denim_material.set_principled_shader_value("Base Color", [0.075, 0.13, 0.20, 1.0])
         denim_material.set_principled_shader_value("Roughness", 0.96)
@@ -464,8 +476,8 @@ def main():
         metal_material.set_principled_shader_value("Roughness", 0.42)
 
         pants_material = bproc.material.create("pants_fabric")
-        pants_material.set_principled_shader_value("Base Color", [0.012, 0.012, 0.015, 1.0])
-        pants_material.set_principled_shader_value("Roughness", 0.95)
+        pants_material.set_principled_shader_value("Base Color", [0.025, 0.027, 0.030, 1.0])
+        pants_material.set_principled_shader_value("Roughness", 0.84)
 
         _, garment_objects = create_target_scene(grid_material, denim_material, metal_material, pants_material)
 
@@ -501,28 +513,92 @@ def main():
             display.replace_materials(display_material)
         rear_parts.append((bezel, display))
 
-    for img_idx in range(args.num_images):
-        if args.scene_profile == "generic":
-            table.replace_materials(np.random.choice(cc_textures))
-        else:
-            table.replace_materials(table_material)
-            neutral = rng.uniform(0.52, 0.66)
-            table_material.set_principled_shader_value(
-                "Base Color", [neutral * rng.uniform(0.94, 1.01),
-                               neutral * rng.uniform(0.97, 1.02),
-                               neutral * rng.uniform(1.00, 1.06), 1.0])
-            show_garment = rng.random() < args.garment_probability
-            for garment_object in garment_objects:
-                garment_object.hide(not show_garment)
+    # ================== 收集需要进行物理随机化的环境材质 ==================
+    dr_materials = [m for m in bproc.material.collect_all() if m.get_name() in 
+                    ["target_table", "denim_garment", "white_wall", "wood_floor", 
+                     "cardboard_box", "pants_fabric", "black_shirt", "dark_equipment"]]
+    # ================== 收集并缓存环境材质的真实属性 ==================
+    dr_materials_names = ["target_table", "denim_garment", "white_wall", "wood_floor", 
+                          "cardboard_box", "pants_fabric", "black_shirt", "dark_equipment"]
+    dr_materials = [m for m in bproc.material.collect_all() if m.get_name() in dr_materials_names]
+    
+    # 用一个字典把真实场景的颜色和粗糙度记录下来，防止被随机化覆盖后找不回来
+    original_mat_states = {}
+    for mat in dr_materials:
+        original_mat_states[mat.get_name()] = {
+            "Base Color": mat.get_principled_shader_value("Base Color"),
+            "Roughness": mat.get_principled_shader_value("Roughness"),
+            "Metallic": mat.get_principled_shader_value("Metallic")
+        }
+    # ================== 缓存衣服代理几何体的初始尺寸 ==================
+    original_garment_scales = [obj.get_scale() for obj in garment_objects]
 
+    for img_idx in range(args.num_images):
+# ------------------ 物理与光照混合随机化 ------------------
+        # 30% 的帧使用受约束的材质与光照扰动，提升抗干扰能力但保持目标域颜色
+        if rng.random() < 0.30:
+            # 1. 轻微光照扰动
+            for light in area_lights:
+                light.set_energy(rng.uniform(11.0, 30.0))
+                light.set_color([rng.uniform(0.88, 1.0), rng.uniform(0.90, 1.0), 1.0])
+                light.set_location([rng.uniform(-0.70, 0.70), rng.uniform(-0.25, 0.70),
+                                    rng.uniform(0.95, 1.35)])
+                    
+            # 2. 保持参考色相，仅改变亮度和很小的通道比例
+            for mat in dr_materials:
+                reference = original_mat_states[mat.get_name()]
+                mat.set_principled_shader_value(
+                    "Base Color",
+                    jitter_reference_color(reference["Base Color"], rng),
+                )
+                roughness = float(reference["Roughness"])
+                metallic = float(reference["Metallic"])
+                mat.set_principled_shader_value("Roughness", np.clip(
+                    roughness + rng.uniform(-0.10, 0.10), 0.0, 1.0))
+                mat.set_principled_shader_value("Metallic", np.clip(
+                    metallic + rng.uniform(-0.08, 0.08), 0.0, 1.0))
+        
+        # 30% 的帧完美恢复为你精心调整过的真实目标场景，稳住基础指标
+        else:
+            # 1. 恢复原本的稳定光照 (原代码中的微小合理波动)
+            original_light_locs = [(-0.55, -0.10), (0.55, -0.10), (-0.35, 0.50), (0.35, 0.50)]
+            for i, light in enumerate(area_lights):
+                light.set_energy(rng.uniform(13.0, 24.0))
+                light.set_color([rng.uniform(0.88, 1.0), rng.uniform(0.90, 1.0), 1.0])
+                light.set_location([original_light_locs[i][0], original_light_locs[i][1], 1.15])
+
+            # 2. 恢复真实的物品材质
+            for mat in dr_materials:
+                mat_name = mat.get_name()
+                mat.set_principled_shader_value("Base Color", original_mat_states[mat_name]["Base Color"])
+                mat.set_principled_shader_value("Roughness", original_mat_states[mat_name]["Roughness"])
+                mat.set_principled_shader_value("Metallic", original_mat_states[mat_name]["Metallic"])
+                
+        # ------------------ 保持手臂特征稳定 ------------------
+        # 手臂无论在哪个分支，都只进行微小的肤色波动
         skin_material.set_principled_shader_value(
-            "Base Color", [float(np.random.uniform(0.28, 0.48)),
-                           float(np.random.uniform(0.12, 0.25)),
-                           float(np.random.uniform(0.07, 0.16)), 1.0])
+            "Base Color", [float(np.random.uniform(0.31, 0.40)),
+                           float(np.random.uniform(0.15, 0.21)),
+                           float(np.random.uniform(0.085, 0.125)), 1.0])
         skin_material.set_principled_shader_value("Roughness", np.random.uniform(0.52, 0.78))
-        for light in area_lights:
-            light.set_energy(rng.uniform(13.0, 24.0))
-            light.set_color([rng.uniform(0.88, 1.0), rng.uniform(0.90, 1.0), 1.0])
+
+
+        # ------------------ 衣服出现概率与形变随机化 ------------------
+        show_garment = rng.random() < args.garment_probability
+        
+        # 随机生成形变系数：X(宽窄), Y(长短), Z(厚度)
+        shape_noise_x = rng.uniform(0.7, 1.5)  
+        shape_noise_y = rng.uniform(0.8, 1.3)  
+        shape_noise_z = rng.uniform(0.2, 2.0)  
+
+        for i, garment_object in enumerate(garment_objects):
+            garment_object.hide(not show_garment) # 根据概率隐藏或显示
+            if show_garment:
+                orig_scale = original_garment_scales[i]
+                # 基于缓存的初始尺寸乘以形变系数
+                garment_object.set_scale([orig_scale[0] * shape_noise_x, 
+                                          orig_scale[1] * shape_noise_y, 
+                                          orig_scale[2] * shape_noise_z])
 
         composition_band, group_x, target = sample_composition(
             rng, args.lower_middle_probability)
