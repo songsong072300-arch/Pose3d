@@ -1,3 +1,4 @@
+import blenderproc as bproc  # 必须放在最顶端第一行
 import os
 import json
 import argparse
@@ -7,7 +8,6 @@ import glob
 import numpy as np
 import bpy
 from PIL import Image, ImageEnhance, ImageFilter
-import blenderproc as bproc
 
 
 def axis_rotation(axis, angle):
@@ -63,7 +63,7 @@ def sample_composition(rng, lower_middle_probability):
     # Y轴数值增大到 0.45-0.65 (让相机抬头看远处，从而把手压在底边)
     return "lower_middle", group_x, np.array([
         aim_x,
-        rng.uniform(0.45, 0.65),
+        rng.uniform(0.25, 0.40),
         rng.uniform(0.015, 0.045),
     ])
 
@@ -586,8 +586,8 @@ def main():
             """
         # ---- ego 相机位姿：上方俯视 + 随机偏头视线噪声 ----
         look_noise = np.array([
-            rng.uniform(-0.35, 0.35),  # 左右随机偏头 (Pan offset)
-            rng.uniform(-0.5, 0.25),  # 上下随机抬头/俯视 (Tilt offset)
+            rng.uniform(-0.20, 0.20),  # 左右随机偏头 (Pan offset)
+            rng.uniform(-0.40, 0.60),  # 上下随机抬头/俯视 (Tilt offset)
             0.0
         ])
         rotation = bproc.camera.rotation_from_forward_vec(
