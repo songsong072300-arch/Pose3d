@@ -63,7 +63,7 @@ def sample_composition(rng, lower_middle_probability):
     # Y轴数值增大到 0.45-0.65 (让相机抬头看远处，从而把手压在底边)
     return "lower_middle", group_x, np.array([
         aim_x,
-        rng.uniform(0.25, 0.40),
+        rng.uniform(0.05, 0.20),
         rng.uniform(0.015, 0.045),
     ])
 
@@ -237,20 +237,86 @@ def create_target_scene(grid_material, denim_material, metal_material, pants_mat
             garment_objects.append(button)
 
     # 3. 在桌缘下方生成黑色裤腿
-    for side in (-1.0, 1.0):
-        leg = create_segment(
-            # 起点：向后方（Y=-0.80）和下方（Z=-0.65）大幅延伸，模拟长腿
-            [side * 0.18, -0.80, -0.65],
-            # 终点：贴近桌子边缘
-            [side * 0.18, -0.02, -0.10],
-            # 粗细：半径从 0.14 增加到 0.22，让裤腿更宽大
-            0.22, pants_material
+    for side in [-0.08, 0.08]: # 稍微拉开一点左右腿间距
+        leg = bproc.object.create_primitive(
+            "CUBE", # 【关键修改】改为立方体
+            # X(宽度) 给够，Y(厚度) 稍微压扁模拟被裤子包裹的平整感，Z(长度) 拉长
+            scale=[0.14, 0.08, 0.35], 
+            location=[side, -0.35, -0.4]
         )
-        if leg is not None:
-            garment_objects.append(leg)
+        # 将长方体放倒并让膝盖朝上倾斜
+        leg.set_rotation_euler([np.pi/2 - 0.3, 0, 0])
+        leg.replace_materials(pants_material)
+        scene_objects.append(leg)
+   # ================== 修正的环境干扰构建 ==================
+
+    # === 1. 模拟操作者位于相机下方的大腿/膝盖 ===
+    pants_material = bproc.material.create("black_pants")
+    pants_material.set_principled_shader_value("Base Color", [0.02, 0.02, 0.02, 1.0])
+    pants_material.set_principled_shader_value("Roughness", 0.95)
+    
+    # 用两个向斜下方倾斜的圆柱体模拟双腿，位置大幅下压 (Z=-0.4)，稍微后退 (Y=-0.35)
+    for side in [-0.15, 0.15]: # 左右腿间距
+        leg = bproc.object.create_primitive(
+            "CYLINDER", 
+            scale=[0.12, 0.12, 0.3], 
+            location=[side, -0.35, -0.4]
+        )
+        # 将圆柱体放倒并让膝盖朝上倾斜
+        leg.set_rotation_euler([np.pi/2 - 0.3, 0, 0])
+        leg.replace_materials(pants_material)
+        scene_objects.append(leg)
+
+    # === 2. 模拟白墙与暗色地板 ===
+    wall_material = bproc.material.create("white_wall")
+    wall_material.set_principled_shader_value("Base Color", [0.7, 0.7, 0.72, 1.0])
+    wall_material.set_principled_shader_value("Roughness", 0.95)
+    
+    floor_material = bproc.material.create("wood_floor")
+    floor_material.set_principled_shader_value("Base Color", [0.15, 0.1, 0.05, 1.0]) 
+    floor_material.set_principled_shader_value("Roughness", 0.8)
+
+    # 墙壁保持在前方
+    wall = bproc.object.create_primitive("PLANE", scale=[2.0, 2.0, 1.0], location=[0, 0.8, 0])
+    wall.set_rotation_euler([np.pi/2, 0, 0]) 
+    wall.replace_materials(wall_material)
+    
+    # 地板保持在下方
+    floor = bproc.object.create_primitive("PLANE", scale=[3.0, 3.0, 1.0], location=[0, 0, -0.8])
+    floor.replace_materials(floor_material)
+    
+    scene_objects.extend([wall, floor])
+
+    # === 3. 模拟画面左侧的深色设备堆叠与右侧零星杂物 ===
+    dark_equipment_mat = bproc.material.create("dark_equipment")
+    dark_equipment_mat.set_principled_shader_value("Base Color", [0.05, 0.05, 0.06, 1.0])
+    dark_equipment_mat.set_principled_shader_value("Roughness", 0.6)
+    
+    box_material = bproc.material.create("cardboard_box")
+    box_material.set_principled_shader_value("Base Color", [0.4, 0.3, 0.15, 1.0])
+    box_material.set_principled_shader_value("Roughness", 0.85)
+
+    import random
+    # 左侧：集中堆放 3-4 个深黑色长方体，紧贴桌子左侧边缘 (X= -0.7 到 -0.9)
+    for i in range(random.randint(3, 4)):
+        left_clutter = bproc.object.create_primitive(
+            "CUBE", 
+            scale=[random.uniform(0.1, 0.2), random.uniform(0.15, 0.3), random.uniform(0.1, 0.4)], 
+            location=[random.uniform(-0.9, -0.7), random.uniform(-0.2, 0.4), -0.5 + i * 0.15]
+        )
+        left_clutter.replace_materials(dark_equipment_mat)
+        scene_objects.append(left_clutter)
+        
+    # 右侧：象征性放 1 个浅色纸箱，制造非对称感
+    right_box = bproc.object.create_primitive(
+        "CUBE", 
+        scale=[0.15, 0.2, 0.25], 
+        location=[random.uniform(0.7, 0.9), random.uniform(0.2, 0.5), -0.4]
+    )
+    right_box.replace_materials(box_material)
+    scene_objects.append(right_box)
 
     return scene_objects, garment_objects
-
 
 def uint8_color(color):
     pixels = np.asarray(color)
@@ -352,7 +418,7 @@ def main():
     else:
         bproc.loader.load_bop_intrinsics(bop_dataset_path=bop_dataset_path)
 
-    table = bproc.object.create_primitive("PLANE", scale=[2.0, 2.0, 1.0], location=[0, 0, 0])
+    table = bproc.object.create_primitive("PLANE", scale=[0.65, 0.55, 1.0], location=[0, 0.1, 0])
     table.set_name("table")
     table_material = bproc.material.create("target_table")
     table_material.set_principled_shader_value("Base Color", [0.58, 0.61, 0.63, 1.0])
