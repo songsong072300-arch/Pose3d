@@ -40,20 +40,27 @@ def expanded_corner_box(corners, image_size, pad=0.15, jitter=0.0):
 class RoiCornerDataset(torch.utils.data.Dataset):
     """Derive one distortion-free corner sample per annotated instance."""
 
-    def __init__(self, root, split="train", pad=0.15, crop_jitter=0.05):
+    def __init__(self, root, split="train", pad=0.15, crop_jitter=0.05,
+                 labels_dir="corner_labels"):
         self.root = Path(root)
         metadata = json.loads(
-            (self.root / "corner_labels/annotations.json").read_text()
+            (self.root / labels_dir / "annotations.json").read_text()
         )
         splits = json.loads(
-            (self.root / "corner_labels/splits.json").read_text()
+            (self.root / labels_dir / "splits.json").read_text()
         )
         wanted = set(splits[split])
-        self.items = [
-            (record, instance)
-            for record in metadata["records"] if record["id"] in wanted
-            for instance in record["instances"]
-        ]
+        self.items = []
+        self.skipped_invisible = 0
+        for record in metadata["records"]:
+            if record["id"] not in wanted:
+                continue
+            for instance in record["instances"]:
+                visible = instance.get("corners_in_frame")
+                if visible is not None and not any(visible):
+                    self.skipped_invisible += 1
+                    continue
+                self.items.append((record, instance))
         self.pad = pad
         self.crop_jitter = crop_jitter if split == "train" else 0.0
 
@@ -86,5 +93,11 @@ class RoiCornerDataset(torch.utils.data.Dataset):
             "image": image_to_tensor(crop),
             "heatmap": torch.from_numpy(heatmaps),
             "corners": torch.from_numpy(roi_corners),
+            "original_corners": torch.from_numpy(corners),
+            "scale_xy": torch.from_numpy(scale_xy),
+            "crop_origin": torch.tensor(crop_box[:2], dtype=torch.float32),
+            "letterbox_padding": torch.tensor(
+                (pad_x, pad_y), dtype=torch.float32,
+            ),
             "id": f"{record['id']}_{instance['instance_id']}",
         }

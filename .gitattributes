@@ -1,0 +1,2 @@
+3D资产/** filter=lfs diff=lfs merge=lfs -text
+TripoSR/dataset/lm/models/** filter=lfs diff=lfs merge=lfs -text

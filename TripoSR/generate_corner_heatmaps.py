@@ -21,6 +21,26 @@ def parse_args():
     parser.add_argument("--heatmap-height", type=int, default=180)
     parser.add_argument("--sigma", type=float, default=2.5)
     parser.add_argument("--seed", type=int, default=2026)
+    parser.add_argument("--image-split", default="train_pbr",
+                        help="BOP scene 子目录，例如 new_train_pbr")
+    parser.add_argument(
+        "--split-mode", choices=("scene", "frame"), default="scene",
+        help=("scene keeps complete BOP scenes in one split and prevents adjacent-frame "
+              "leakage; frame retains the legacy random frame split."),
+    )
+    parser.add_argument(
+        "--val-scene-count", type=int, default=1,
+        help="Number of complete scenes assigned to validation in scene mode.",
+    )
+    parser.add_argument(
+        "--test-scene-count", type=int, default=0,
+        help="Number of complete scenes assigned to test in scene mode.",
+    )
+    parser.add_argument(
+        "--output-root", type=Path, default=None,
+        help="Directory for annotations.json, splits.json, and heatmaps; "
+             "defaults to <dataset>/corner_labels.",
+    )
     return parser.parse_args()
 
 
@@ -56,6 +76,59 @@ def draw_gaussian(heatmap, center_x, center_y, sigma):
     heatmap[y0:y1, x0:x1] = np.maximum(heatmap[y0:y1, x0:x1], patch)
 
 
+def build_splits(records, split_mode, seed, val_scene_count, test_scene_count):
+    """Split label IDs while keeping complete render scenes isolated by default."""
+    rng = random.Random(seed)
+    count = len(records)
+    if split_mode == "frame":
+        shuffled = records.copy()
+        rng.shuffle(shuffled)
+        train_end = int(count * 0.8)
+        val_end = train_end + int(count * 0.1)
+        return {
+            "train": [item["id"] for item in shuffled[:train_end]],
+            "val": [item["id"] for item in shuffled[train_end:val_end]],
+            "test": [item["id"] for item in shuffled[val_end:]],
+            "mode": "frame",
+        }
+
+    scenes = sorted({item["id"].split("_", 1)[0] for item in records})
+    if val_scene_count < 1:
+        raise ValueError("--val-scene-count must be at least 1 in scene mode")
+    if test_scene_count < 0:
+        raise ValueError("--test-scene-count cannot be negative")
+    held_out = val_scene_count + test_scene_count
+    if len(scenes) <= held_out:
+        raise ValueError(
+            f"scene split needs more than {held_out} scenes, found {len(scenes)}")
+
+    rng.shuffle(scenes)
+    test_scenes = set(scenes[:test_scene_count])
+    val_start = test_scene_count
+    val_scenes = set(scenes[val_start:val_start + val_scene_count])
+    train_scenes = set(scenes[val_start + val_scene_count:])
+    split_scene_sets = {
+        "train": train_scenes,
+        "val": val_scenes,
+        "test": test_scenes,
+    }
+    splits = {name: [] for name in split_scene_sets}
+    for item in records:
+        scene = item["id"].split("_", 1)[0]
+        for name, scene_set in split_scene_sets.items():
+            if scene in scene_set:
+                splits[name].append(item["id"])
+                break
+    return {
+        **splits,
+        "mode": "scene",
+        "scenes": {
+            name: sorted(scene_set)
+            for name, scene_set in split_scene_sets.items()
+        },
+    }
+
+
 def main():
     args = parse_args()
     dataset = args.dataset.expanduser().resolve()
@@ -66,13 +139,17 @@ def main():
     render_config_path = dataset / "render_config.json"
     if render_config_path.exists():
         model_scale = float(json.loads(render_config_path.read_text()).get("model_scale", 1.0))
-    output_root = dataset / "corner_labels"
+    output_root = (
+        args.output_root.expanduser().resolve()
+        if args.output_root is not None
+        else dataset / "corner_labels"
+    )
     heatmap_dir = output_root / "heatmaps"
     heatmap_dir.mkdir(parents=True, exist_ok=True)
 
     records = []
     channel_order = (bbox_corners(models_info["1"]) * model_scale).tolist()
-    for scene_dir in sorted((dataset / "train_pbr").glob("[0-9][0-9][0-9][0-9][0-9][0-9]")):
+    for scene_dir in sorted((dataset / args.image_split).glob("[0-9][0-9][0-9][0-9][0-9][0-9]")):
         scene_gt = json.loads((scene_dir / "scene_gt.json").read_text())
         scene_camera = json.loads((scene_dir / "scene_camera.json").read_text())
         for frame_key in sorted(scene_gt, key=int):
@@ -105,25 +182,29 @@ def main():
             label_id = f"{int(scene_dir.name):06d}_{int(frame_key):06d}"
             heatmap_path = heatmap_dir / f"{label_id}.npz"
             np.savez_compressed(heatmap_path, heatmaps=np.rint(heatmaps * 255).astype(np.uint8))
+            try:
+                heatmap_record_path = heatmap_path.relative_to(dataset)
+            except ValueError:
+                heatmap_record_path = heatmap_path
             records.append({
                 "id": label_id,
                 "image": str(image_path.relative_to(dataset)),
-                "heatmap": str(heatmap_path.relative_to(dataset)),
+                "heatmap": str(heatmap_record_path),
                 "image_size": [width, height],
                 "heatmap_size": [args.heatmap_width, args.heatmap_height],
                 "instances": instances_out,
             })
 
-    rng = random.Random(args.seed)
-    rng.shuffle(records)
     count = len(records)
-    train_end = int(count * 0.8)
-    val_end = train_end + int(count * 0.1)
-    splits = {
-        "train": [item["id"] for item in records[:train_end]],
-        "val": [item["id"] for item in records[train_end:val_end]],
-        "test": [item["id"] for item in records[val_end:]],
-    }
+    if not count:
+        raise ValueError(f"No BOP frames found under {dataset / args.image_split}")
+    splits = build_splits(
+        records,
+        split_mode=args.split_mode,
+        seed=args.seed,
+        val_scene_count=args.val_scene_count,
+        test_scene_count=args.test_scene_count,
+    )
     (output_root / "annotations.json").write_text(json.dumps({
         "corner_channel_order_mm": channel_order,
         "records": sorted(records, key=lambda item: item["id"]),

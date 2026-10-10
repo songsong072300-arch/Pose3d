@@ -13,6 +13,8 @@ def main():
     parser.add_argument("--weights", required=True)
     parser.add_argument("--out", default="outputs/detections.jpg")
     parser.add_argument("--conf", type=float, default=0.25)
+    parser.add_argument("--iou", type=float, default=0.50)
+    parser.add_argument("--max-det", type=int, choices=(1, 2), default=2)
     args = parser.parse_args()
 
     try:
@@ -28,11 +30,12 @@ def main():
         and torch.backends.mps.is_available() else "cpu"
     )
     prediction = YOLO(args.weights).predict(
-        image, conf=args.conf, verbose=False, device=device,
+        image, conf=args.conf, iou=args.iou, max_det=args.max_det,
+        verbose=False, device=device,
     )[0]
     boxes = prediction.boxes.xyxy.detach().cpu().numpy()
     scores = prediction.boxes.conf.detach().cpu().numpy()
-    for instance_id, index in enumerate(np.argsort(scores)[::-1][:2]):
+    for instance_id, index in enumerate(np.argsort(scores)[::-1][:args.max_det]):
         x1, y1, x2, y2 = boxes[index].astype(int)
         cv2.rectangle(image, (x1, y1), (x2, y2), (0, 255, 0), 3)
         cv2.putText(image, f"ACTION4 {scores[index]:.2f}",

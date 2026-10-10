@@ -18,3 +18,13 @@ yolov8n.pt
 .vscode/
 手搓_pose3d/
 TripoSR/dataset/ego-preview/
+
+# Local model/tool caches and generated experiment data.
+.torch-cache/
+.ultralytics/
+weights/
+yolo11n.pt
+*.pt
+TripoSR/dataset/lm/*train_pbr*/
+TripoSR/dataset/lm/*corner_labels*/
+TripoSR/dataset/lm/merged_action4/

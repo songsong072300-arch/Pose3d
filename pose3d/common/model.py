@@ -1,6 +1,8 @@
 """Fixed DINOv2-Small network for eight ordered 2D box corners."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import torch
 from torch import nn
 import torch.nn.functional as F
@@ -8,6 +10,18 @@ import torch.nn.functional as F
 
 IMAGE_SIZE = (168, 224)  # H, W; divisible by DINOv2 patch size 14.
 DECODER_DIM = 128
+
+
+def load_dinov2_backbone():
+    project_cache = Path(__file__).resolve().parents[2] / ".torch-cache" / "hub"
+    hub_dirs = (Path(torch.hub.get_dir()), project_cache)
+    for hub_dir in hub_dirs:
+        repository = hub_dir / "facebookresearch_dinov2_main"
+        if repository.is_dir():
+            return torch.hub.load(
+                str(repository), "dinov2_vits14", source="local",
+            )
+    return torch.hub.load("facebookresearch/dinov2", "dinov2_vits14")
 
 
 class ConvNormAct(nn.Sequential):
@@ -43,9 +57,7 @@ class CornerHeatmapNet(nn.Module):
     """
     def __init__(self):
         super().__init__()
-        self.backbone = torch.hub.load(
-            "facebookresearch/dinov2", "dinov2_vits14",
-        )
+        self.backbone = load_dinov2_backbone()
         self.backbone.eval()
         for parameter in self.backbone.parameters():
             parameter.requires_grad_(False)
@@ -80,10 +92,10 @@ class CornerHeatmapNet(nn.Module):
     def forward(self, image):
         if tuple(image.shape[-2:]) != IMAGE_SIZE:
             raise ValueError(f"expected input size {IMAGE_SIZE}, got {image.shape[-2:]}")
-        with torch.no_grad():
-            features = self.backbone.get_intermediate_layers(
+
+        features = self.backbone.get_intermediate_layers(
                 image, n=4, reshape=True, norm=True,
-            )
+        )
         projected = [layer(feature)
                      for layer, feature in zip(self.projections, features)]
         decoded = self.fuse(torch.cat(projected, dim=1))

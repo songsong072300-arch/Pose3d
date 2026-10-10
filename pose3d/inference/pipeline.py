@@ -63,10 +63,13 @@ class CornerResult:
 
 def load_corner_model(checkpoint_path, device):
     checkpoint = torch.load(checkpoint_path, map_location=device)
-    if not isinstance(checkpoint, dict) or "decoder" not in checkpoint:
-        raise ValueError("checkpoint must contain a 'decoder' state")
+    if not isinstance(checkpoint, dict):
+        raise ValueError("checkpoint must be a dictionary")
+    state = checkpoint.get("model_state", checkpoint.get("decoder"))
+    if state is None:
+        raise ValueError("checkpoint must contain 'model_state' or 'decoder'")
     model = CornerHeatmapNet().to(device)
-    incompatible = model.load_state_dict(checkpoint["decoder"], strict=False)
+    incompatible = model.load_state_dict(state, strict=False)
     invalid_missing = [name for name in incompatible.missing_keys
                        if not name.startswith("backbone.")]
     if invalid_missing or incompatible.unexpected_keys:
@@ -81,7 +84,12 @@ class VideoCornerPipeline:
     """Detect up to two instances and return eight corners for each one."""
 
     def __init__(self, corner_weights, detector_weights, device="auto",
-                 crop_pad=0.15, corner_threshold=0.15):
+                 crop_pad=0.15, corner_threshold=0.15, detector_conf=0.25,
+                 detector_iou=0.50, max_det=2):
+        if max_det not in (1, 2):
+            raise ValueError("max_det must be 1 or 2 for this camera pipeline")
+        if not 0 < detector_conf <= 1 or not 0 < detector_iou <= 1:
+            raise ValueError("detector_conf and detector_iou must be in (0, 1]")
         if device == "auto":
             device = (
                 "cuda" if torch.cuda.is_available() else
@@ -94,14 +102,18 @@ class VideoCornerPipeline:
         self.detector = YOLO(detector_weights)
         self.crop_pad = crop_pad
         self.corner_threshold = corner_threshold
+        self.detector_conf = detector_conf
+        self.detector_iou = detector_iou
+        self.max_det = max_det
 
     def _detect(self, frame):
         prediction = self.detector.predict(
-            frame, verbose=False, device=self.device,
+            frame, conf=self.detector_conf, iou=self.detector_iou,
+            max_det=self.max_det, verbose=False, device=self.device,
         )[0]
         boxes = prediction.boxes.xyxy.detach().cpu().numpy()
         scores = prediction.boxes.conf.detach().cpu().numpy()
-        selected = np.argsort(scores)[::-1][:2]
+        selected = np.argsort(scores)[::-1][:self.max_det]
         return [(boxes[index], float(scores[index])) for index in selected]
 
     def __call__(self, frame):

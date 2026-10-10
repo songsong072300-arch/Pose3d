@@ -16,6 +16,9 @@ def main():
     parser.add_argument("--device", default="auto",
                         choices=["auto", "cuda", "mps", "cpu"])
     parser.add_argument("--corner-threshold", type=float, default=0.15)
+    parser.add_argument("--detector-conf", type=float, default=0.25)
+    parser.add_argument("--detector-iou", type=float, default=0.50)
+    parser.add_argument("--max-det", type=int, choices=(1, 2), default=2)
     args = parser.parse_args()
 
     pipeline = VideoCornerPipeline(
@@ -23,6 +26,9 @@ def main():
         args.detector,
         device=args.device,
         corner_threshold=args.corner_threshold,
+        detector_conf=args.detector_conf,
+        detector_iou=args.detector_iou,
+        max_det=args.max_det,
     )
     capture = cv2.VideoCapture(args.video)
     if not capture.isOpened():
