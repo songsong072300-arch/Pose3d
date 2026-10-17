@@ -30,7 +30,33 @@ def corner_coordinate_loss(pred, corners, temperature=50.0):
     return F.smooth_l1_loss(predicted_corners / scale, corners / scale)
 
 
-def corner_heatmap_loss(pred, target, corners, coordinate_weight=2.0):
+def corner_heatmap_loss(pred, target, corners, coordinate_weight=2.0,
+                        coarse_corners=None, geometry_weight=0.5,
+                        consistency_weight=0.1):
     coarse = heatmap_loss(pred, target)
     fine = corner_coordinate_loss(pred, corners)
-    return coarse + coordinate_weight * fine, coarse.detach(), fine.detach()
+    geometry = pred.new_zeros(())
+    consistency = pred.new_zeros(())
+    if coarse_corners is not None:
+        height, width = pred.shape[-2:]
+        scale = pred.new_tensor((width - 1, height - 1))
+        target_normalized = corners / scale
+        predicted_normalized = spatial_soft_argmax(pred) / scale
+        geometry = F.smooth_l1_loss(coarse_corners, target_normalized)
+        consistency = F.smooth_l1_loss(
+            predicted_normalized, coarse_corners,
+        )
+    total = (
+        coarse + coordinate_weight * fine
+        + geometry_weight * geometry
+        + consistency_weight * consistency
+    )
+    if coarse_corners is None:
+        return total, coarse.detach(), fine.detach()
+    return (
+        total,
+        coarse.detach(),
+        fine.detach(),
+        geometry.detach(),
+        consistency.detach(),
+    )

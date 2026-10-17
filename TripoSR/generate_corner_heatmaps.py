@@ -46,6 +46,10 @@ def parse_args():
 
 def bbox_corners(info):
     # Stable channel order: binary XYZ, with X changing slowest and Z fastest.
+    info = dict(info)
+    for axis in "xyz":
+        if f"max_{axis}" not in info:
+            info[f"max_{axis}"] = info[f"min_{axis}"] + info[f"size_{axis}"]
     return np.array([
         [x, y, z]
         for x in (info["min_x"], info["max_x"])
@@ -132,13 +136,23 @@ def build_splits(records, split_mode, seed, val_scene_count, test_scene_count):
 def main():
     args = parse_args()
     dataset = args.dataset.expanduser().resolve()
-    models_info = json.loads((dataset / "models" / "models_info.json").read_text())
-    # 渲染器若对模型做了整体缩放（render_config.json），角点真值需同步缩放，
-    # 否则热图标签与渲染机身不重合。
+    # Prefer split-specific bounds when a replacement mesh was rendered. This
+    # prevents new RGB data from being labeled with the legacy BOP model bounds.
     model_scale = 1.0
-    render_config_path = dataset / "render_config.json"
+    render_config_path = dataset / args.image_split / "render_config.json"
+    if not render_config_path.exists():
+        render_config_path = dataset / "render_config.json"
+    render_config = {}
     if render_config_path.exists():
-        model_scale = float(json.loads(render_config_path.read_text()).get("model_scale", 1.0))
+        render_config = json.loads(render_config_path.read_text())
+        model_scale = float(render_config.get("model_scale", 1.0))
+    replacement_bounds = render_config.get("corner_bounds_mm")
+    models_info = ({} if replacement_bounds else
+                   json.loads((dataset / "models" / "models_info.json").read_text()))
+
+    def instance_corners(obj_id):
+        info = replacement_bounds or models_info[str(obj_id)]
+        return bbox_corners(info) * model_scale
     output_root = (
         args.output_root.expanduser().resolve()
         if args.output_root is not None
@@ -148,7 +162,7 @@ def main():
     heatmap_dir.mkdir(parents=True, exist_ok=True)
 
     records = []
-    channel_order = (bbox_corners(models_info["1"]) * model_scale).tolist()
+    channel_order = instance_corners(1).tolist()
     for scene_dir in sorted((dataset / args.image_split).glob("[0-9][0-9][0-9][0-9][0-9][0-9]")):
         scene_gt = json.loads((scene_dir / "scene_gt.json").read_text())
         scene_camera = json.loads((scene_dir / "scene_camera.json").read_text())
@@ -162,7 +176,7 @@ def main():
             heatmaps = np.zeros((8, args.heatmap_height, args.heatmap_width), dtype=np.float32)
             instances_out = []
             for instance_index, instance in enumerate(scene_gt[frame_key]):
-                corners_3d = bbox_corners(models_info[str(instance["obj_id"])]) * model_scale
+                corners_3d = instance_corners(instance["obj_id"])
                 pixels, depths = project(corners_3d, instance, K)
                 in_frame = ((pixels[:, 0] >= 0) & (pixels[:, 0] < width)
                             & (pixels[:, 1] >= 0) & (pixels[:, 1] < height)

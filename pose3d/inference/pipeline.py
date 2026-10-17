@@ -12,6 +12,17 @@ import torch
 from ..common.image import image_to_tensor, letterbox_image
 from ..common.model import CornerHeatmapNet
 
+# Ordered 3D box corners: three edges from corner 0, then the opposite face.
+BOX_EDGES = [
+    (0, 1), (0, 2), (0, 4),
+    (1, 3), (1, 5),
+    (2, 3), (2, 6),
+    (3, 7),
+    (4, 5), (4, 6),
+    (5, 7),
+    (6, 7),
+]
+
 
 def box_crop(frame_size, box, pad=0.15):
     """Expand a detector xyxy box and clamp it to the image."""
@@ -70,8 +81,16 @@ def load_corner_model(checkpoint_path, device):
         raise ValueError("checkpoint must contain 'model_state' or 'decoder'")
     model = CornerHeatmapNet().to(device)
     incompatible = model.load_state_dict(state, strict=False)
+    if "query_scale" in incompatible.missing_keys:
+        with torch.no_grad():
+            model.query_scale.zero_()
+    optional_prefixes = (
+        "corner_queries", "image_position", "query_decoder.",
+        "pixel_projection.", "query_scale", "geometry_head.",
+    )
     invalid_missing = [name for name in incompatible.missing_keys
-                       if not name.startswith("backbone.")]
+                       if not name.startswith("backbone.")
+                       and not name.startswith(optional_prefixes)]
     if invalid_missing or incompatible.unexpected_keys:
         raise ValueError(
             f"incompatible checkpoint: missing={invalid_missing}, "
@@ -149,6 +168,16 @@ def draw_results(frame, results):
         cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 255, 0), 2)
         cv2.putText(frame, f"camera {instance_id + 1}", (x1, max(20, y1 - 7)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, (0, 255, 0), 2)
+        # Connect valid predictions so the projected 3D box is visible.
+        for start, end in BOX_EDGES:
+            start_xy, end_xy = result.corners[start], result.corners[end]
+            if np.isfinite(start_xy).all() and np.isfinite(end_xy).all():
+                cv2.line(
+                    frame,
+                    tuple(np.rint(start_xy).astype(int)),
+                    tuple(np.rint(end_xy).astype(int)),
+                    (255, 160, 0), 2, cv2.LINE_AA,
+                )
         for corner_id, (x, y) in enumerate(result.corners):
             if not np.isfinite((x, y)).all():
                 continue

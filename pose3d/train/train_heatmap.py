@@ -71,6 +71,8 @@ def main():
     parser.add_argument("--amp", action="store_true",
                         help="enable CUDA mixed precision")
     parser.add_argument("--coordinate-weight", type=float, default=2.0)
+    parser.add_argument("--geometry-weight", type=float, default=0.5)
+    parser.add_argument("--consistency-weight", type=float, default=0.1)
     args = parser.parse_args()
 
     torch.manual_seed(args.seed)
@@ -118,15 +120,20 @@ def main():
     for epoch in range(args.epochs):
         net.train()
         train_total = train_coarse = train_fine = 0.0
+        train_geometry = train_consistency = 0.0
         for batch in train_loader:
             images = batch["image"].to(device)
             targets = batch["heatmap"].to(device)
             corners = batch["corners"].to(device)
             with torch.autocast("cuda", enabled=use_amp):
-                prediction = net(images)
-                loss, coarse, fine = corner_heatmap_loss(
+                output = net(images, return_aux=True)
+                prediction = output["heatmaps"]
+                loss, coarse, fine, geometry, consistency = corner_heatmap_loss(
                     prediction, targets, corners,
                     coordinate_weight=args.coordinate_weight,
+                    coarse_corners=output["coarse_corners"],
+                    geometry_weight=args.geometry_weight,
+                    consistency_weight=args.consistency_weight,
                 )
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
@@ -135,6 +142,8 @@ def main():
             train_total += loss.item()
             train_coarse += coarse.item()
             train_fine += fine.item()
+            train_geometry += geometry.item()
+            train_consistency += consistency.item()
         scheduler.step()
 
         net.eval()
@@ -142,12 +151,16 @@ def main():
         val_samples = 0
         with torch.no_grad():
             for batch in val_loader:
-                prediction = net(batch["image"].to(device))
-                loss, _, _ = corner_heatmap_loss(
+                output = net(batch["image"].to(device), return_aux=True)
+                prediction = output["heatmaps"]
+                loss, _, _, _, _ = corner_heatmap_loss(
                     prediction,
                     batch["heatmap"].to(device),
                     batch["corners"].to(device),
                     coordinate_weight=args.coordinate_weight,
+                    coarse_corners=output["coarse_corners"],
+                    geometry_weight=args.geometry_weight,
+                    consistency_weight=args.consistency_weight,
                 )
                 count = batch["image"].shape[0]
                 val_total += loss.item()
@@ -165,6 +178,8 @@ def main():
             f"train={train_total / train_batches:.5f} "
             f"coarse={train_coarse / train_batches:.5f} "
             f"fine={train_fine / train_batches:.5f} "
+            f"geometry={train_geometry / train_batches:.5f} "
+            f"consistency={train_consistency / train_batches:.5f} "
             f"val={val_loss:.5f} "
             f"corner_err_roi={val_roi_error:.2f}px "
             f"corner_err_original={val_original_error:.2f}px"
@@ -186,6 +201,9 @@ def main():
                 "val_corner_err": val_roi_error,
                 "val_corner_err_roi": val_roi_error,
                 "val_corner_err_original": val_original_error,
+                "architecture": "geometry_query_v1",
+                "geometry_weight": args.geometry_weight,
+                "consistency_weight": args.consistency_weight,
             }, output_path)
     print(
         f"saved: {args.out}  "

@@ -10,9 +10,8 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from ..common.model import CornerHeatmapNet
 from ..train.dataset import RoiCornerDataset
-from .pipeline import extract_peaks
+from .pipeline import extract_peaks, load_corner_model
 
 
 BOX_EDGES = [
@@ -30,23 +29,8 @@ PRED_COLOR = (220, 40, 220)
 
 def load_model(path, device):
     checkpoint = torch.load(path, map_location="cpu", weights_only=False)
-    model = CornerHeatmapNet()
-    if "model_state" in checkpoint:
-        model.load_state_dict(checkpoint["model_state"], strict=True)
-    elif "decoder" in checkpoint:
-        incompatible = model.load_state_dict(checkpoint["decoder"], strict=False)
-        invalid_missing = [
-            name for name in incompatible.missing_keys
-            if not name.startswith("backbone.")
-        ]
-        if invalid_missing or incompatible.unexpected_keys:
-            raise ValueError(
-                f"incompatible checkpoint: missing={invalid_missing}, "
-                f"unexpected={incompatible.unexpected_keys}"
-            )
-    else:
-        raise ValueError("checkpoint must contain model_state or decoder")
-    return model.to(device).eval(), checkpoint
+    model = load_corner_model(path, device)
+    return model, checkpoint
 
 
 def original_predictions(heatmaps, batch):

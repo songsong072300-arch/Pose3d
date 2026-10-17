@@ -12,6 +12,15 @@ import bpy
 from PIL import Image, ImageEnhance, ImageFilter
 
 
+DEFAULT_CAMERA_MODEL_DIR = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "..", "相机3D模型", "相机3D模型",
+))
+REFINED_CAMERA_MODEL_DIR = os.path.abspath(os.path.join(
+    os.path.dirname(__file__), "..", "assets", "refined_action_camera"))
+if os.path.isfile(os.path.join(REFINED_CAMERA_MODEL_DIR, "refined_camera.blend")):
+    DEFAULT_CAMERA_MODEL_DIR = REFINED_CAMERA_MODEL_DIR
+
+
 def axis_rotation(axis, angle):
     """Create a 3x3 right-handed rotation matrix."""
     c, s = np.cos(angle), np.sin(angle)
@@ -87,9 +96,13 @@ def sample_composition(rng, lower_middle_probability):
     ])
 
 
-def set_local_pose(part, object_location, object_rotation, local_location):
+def set_local_pose(part, object_location, object_rotation, local_location,
+                   local_rotation=None):
     part.set_location(object_location + object_rotation @ np.asarray(local_location))
-    part.set_rotation_mat(object_rotation)
+    rotation = object_rotation
+    if local_rotation is not None:
+        rotation = object_rotation @ local_rotation
+    part.set_rotation_mat(rotation)
 
 
 def sample_ego_pose(rng, mode):
@@ -165,12 +178,31 @@ def configure_cloth_grid(material):
     links.new(colors.outputs[0], shader.inputs["Base Color"])
 
 
-def configure_screen_content(material):
-    """Procedural synthetic preview texture; no pixels from real_dev."""
+def configure_screen_content(material, image_path=None):
+    """Configure either the supplied Action 4 screen or a procedural fallback."""
     mat = material.blender_obj
     mat.use_nodes = True
     nodes, links = mat.node_tree.nodes, mat.node_tree.links
     shader = next(n for n in nodes if n.type == "BSDF_PRINCIPLED")
+    if image_path:
+        if not os.path.isfile(image_path):
+            raise FileNotFoundError(f"camera screen texture missing: {image_path}")
+        coords = nodes.new("ShaderNodeTexCoord")
+        texture = nodes.new("ShaderNodeTexImage")
+        texture.image = bpy.data.images.load(image_path, check_existing=True)
+        texture.image.colorspace_settings.name = "sRGB"
+        texture.extension = "CLIP"
+        links.new(coords.outputs["UV"], texture.inputs["Vector"])
+        links.new(texture.outputs["Color"], shader.inputs["Base Color"])
+        emission = shader.inputs.get("Emission Color") or shader.inputs.get("Emission")
+        if emission is not None:
+            links.new(texture.outputs["Color"], emission)
+        strength = shader.inputs.get("Emission Strength")
+        if strength is not None:
+            strength.default_value = 0.12
+        shader.inputs["Roughness"].default_value = 0.24
+        return
+
     coords = nodes.new("ShaderNodeTexCoord")
     noise = nodes.new("ShaderNodeTexNoise")
     noise.inputs["Scale"].default_value = 3.0
@@ -205,7 +237,7 @@ def create_camera_appearance_parts(proxy_scale, materials):
         "CUBE", scale=(np.array([0.0010, 0.0310, 0.0188]) * proxy_scale).tolist())
     parts["bezel"].replace_materials(bezel_material)
     parts["display"] = bproc.object.create_primitive(
-        "CUBE", scale=(np.array([0.0006, 0.0287, 0.0165]) * proxy_scale).tolist())
+        "PLANE", scale=(np.array([0.0190, 0.0295, 1.0]) * proxy_scale).tolist())
     parts["display"].replace_materials(display_material)
 
     parts["top_label"] = bproc.object.create_primitive(
@@ -231,11 +263,15 @@ def create_camera_appearance_parts(proxy_scale, materials):
 
 
 def place_camera_appearance_parts(parts, location, rotation, proxy_scale,
-                                  show_screen, show_label, show_tag, show_led):
+                                  show_screen, show_label, show_tag, show_led,
+                                  face_sign=1.0):
+    if not parts:  # Refined asset already contains all physical appearance parts.
+        return
     set_local_pose(parts["bezel"], location, rotation,
-                   np.array([0.0153, 0.0, 0.0]) * proxy_scale)
+                   np.array([face_sign * 0.0170, 0.0, 0.0]) * proxy_scale)
     set_local_pose(parts["display"], location, rotation,
-                   np.array([0.0160, 0.0, 0.0]) * proxy_scale)
+                   np.array([face_sign * 0.0182, 0.0, 0.0]) * proxy_scale,
+                   axis_rotation("y", face_sign * np.pi / 2.0))
     set_local_pose(parts["top_label"], location, rotation,
                    np.array([0.0000, 0.0040, 0.02245]) * proxy_scale)
     set_local_pose(parts["tag_base"], location, rotation,
@@ -257,6 +293,8 @@ def place_camera_appearance_parts(parts, location, rotation, proxy_scale,
 
 
 def all_camera_parts(parts):
+    if not parts:
+        return []
     result = [parts["bezel"], parts["display"], parts["top_label"],
               parts["tag_base"], parts["status_led"]]
     result.extend(pixel for pixel, _, _ in parts["tag_pixels"])
@@ -336,6 +374,121 @@ def attach_asset_pbr_maps(obj, asset_dir):
         links.new(normal.outputs["Color"], node.inputs["Color"])
         links.new(node.outputs["Normal"], shader.inputs["Normal"])
     shader.inputs["Roughness"].default_value = max(float(shader.inputs["Roughness"].default_value), 0.72)
+
+
+def attach_camera_asset_pbr_maps(obj, asset_dir):
+    """Bind the PBR texture set shipped with the replacement camera mesh."""
+    materials = obj.get_materials()
+    if not materials:
+        material = bproc.material.create("replacement_camera_material")
+        obj.replace_materials(material)
+        materials = [material]
+
+    for material_index, material in enumerate(materials):
+        blender_material = material.blender_obj
+        blender_material.use_nodes = True
+        nodes, links = blender_material.node_tree.nodes, blender_material.node_tree.links
+        shader = next(node for node in nodes if node.type == "BSDF_PRINCIPLED")
+
+        def texture(name, colorspace):
+            path = os.path.join(asset_dir, name)
+            if not os.path.isfile(path):
+                return None
+            node = nodes.new("ShaderNodeTexImage")
+            node.image = bpy.data.images.load(path, check_existing=True)
+            node.image.colorspace_settings.name = colorspace
+            return node
+
+        diffuse = texture("texture_diffuse.png", "sRGB")
+        if diffuse:
+            links.new(diffuse.outputs["Color"], shader.inputs["Base Color"])
+        roughness = texture("texture_roughness.png", "Non-Color")
+        if roughness:
+            links.new(roughness.outputs["Color"], shader.inputs["Roughness"])
+        metallic = texture("texture_metallic.png", "Non-Color")
+        if metallic:
+            links.new(metallic.outputs["Color"], shader.inputs["Metallic"])
+        normal = texture("texture_normal.png", "Non-Color")
+        if normal:
+            normal_map = nodes.new("ShaderNodeNormalMap")
+            normal_map.inputs["Strength"].default_value = 0.35
+            links.new(normal.outputs["Color"], normal_map.inputs["Color"])
+            links.new(normal_map.outputs["Normal"], shader.inputs["Normal"])
+        shader.inputs["Base Color"].default_value = [0.012, 0.014, 0.016, 1.0]
+        shader.inputs["Roughness"].default_value = 0.52
+        blender_material.name = f"replacement_camera_material_{material_index}"
+
+
+def load_replacement_camera_objects(asset_dir, count=2, target_width=0.065):
+    """Load, orient and metrically normalize the user-supplied camera mesh.
+
+    The OBJ front is +Z with width along X and height along Y. The renderer uses
+    +X as the front, +Y as width and +Z as height, hence the Z/X/Y permutation.
+    """
+    blend_path = os.path.join(asset_dir, "refined_camera.blend")
+    if os.path.isfile(blend_path):
+        with bpy.data.libraries.load(blend_path, link=False) as (source, loaded):
+            loaded.objects = ["refined_action_camera"]
+        mesh = loaded.objects[0]
+        if mesh is None:
+            raise ValueError(f"refined_action_camera mesh missing in {blend_path}")
+        bpy.context.collection.objects.link(mesh)
+        template = bproc.types.MeshObject(mesh)
+        with open(os.path.join(asset_dir, "model_info.json"), encoding="utf-8") as f:
+            bounds = json.load(f)["corner_bounds_mm"]
+        # Read bounds from geometry, rather than trusting a stale sidecar.
+        vertices = np.asarray([v.co[:] for v in mesh.data.vertices]) * 1000.0
+        lo, hi = vertices.min(0), vertices.max(0)
+        for i, axis in enumerate("xyz"):
+            if not np.allclose([bounds[f"min_{axis}"], bounds[f"max_{axis}"]],
+                               [lo[i], hi[i]], atol=0.001):
+                raise ValueError("refined camera geometry and model_info.json disagree")
+        objects = [template] + [template.duplicate(linked=True) for _ in range(count - 1)]
+        for index, obj in enumerate(objects):
+            obj.set_name(f"refined_action_camera_{index + 1}")
+            obj.set_cp("category_id", 1)
+        return objects, bounds
+    obj_path = os.path.join(asset_dir, "base.obj")
+    loaded = bproc.loader.load_obj(obj_path, forward_axis="Y", up_axis="Z")
+    if len(loaded) != 1:
+        raise RuntimeError(f"expected one camera mesh in {obj_path}, found {len(loaded)}")
+    template = loaded[0]
+    attach_camera_asset_pbr_maps(template, asset_dir)
+    template.set_shading_mode("auto")
+
+    vertices = np.asarray([
+        list(vertex.co) for vertex in template.blender_obj.data.vertices
+    ], dtype=np.float64)
+    oriented = vertices[:, [2, 0, 1]]
+    lo, hi = oriented.min(axis=0), oriented.max(axis=0)
+    centre = (lo + hi) / 2.0
+    scale = float(target_width) / max(float(hi[1] - lo[1]), 1e-9)
+    normalized = (oriented - centre) * scale
+    for vertex, point in zip(template.blender_obj.data.vertices, normalized):
+        vertex.co = point
+    template.blender_obj.data.update()
+    template.set_scale([1.0, 1.0, 1.0])
+
+    objects = [template]
+    for _ in range(1, count):
+        objects.append(template.duplicate(linked=True))
+    for index, obj in enumerate(objects):
+        obj.set_name(f"replacement_action_camera_{index + 1}")
+        obj.set_cp("category_id", 1)
+
+    normalized_lo = normalized.min(axis=0)
+    normalized_hi = normalized.max(axis=0)
+    bounds_mm = {
+        "min_x": float(normalized_lo[0] * 1000.0),
+        "min_y": float(normalized_lo[1] * 1000.0),
+        "min_z": float(normalized_lo[2] * 1000.0),
+        "size_x": float((normalized_hi[0] - normalized_lo[0]) * 1000.0),
+        "size_y": float((normalized_hi[1] - normalized_lo[1]) * 1000.0),
+        "size_z": float((normalized_hi[2] - normalized_lo[2]) * 1000.0),
+    }
+    for axis in "xyz":
+        bounds_mm[f"max_{axis}"] = bounds_mm[f"min_{axis}"] + bounds_mm[f"size_{axis}"]
+    return objects, bounds_mm
 
 
 def load_asset_object(asset_dir, name, target_size, location, rotation=None, floor_z=0.0):
@@ -790,6 +943,12 @@ def main():
                         help="对 target RGB 应用接近测试视频的曝光、饱和度、模糊和 JPEG 退化")
     parser.add_argument("--rear-screen-proxy", action=argparse.BooleanOptionalAction, default=True,
                         help="添加具有随机亮度的背屏代理（默认开启）")
+    parser.add_argument(
+        "--camera-model-dir",
+        default=DEFAULT_CAMERA_MODEL_DIR if os.path.isdir(DEFAULT_CAMERA_MODEL_DIR) else None,
+        help=("相机资产目录；优先使用 assets/refined_action_camera 的完整模型，支持旧 OBJ/PBR 目录，"
+              "传入空字符串可回退到 BOP models/obj_000001.ply"),
+    )
     parser.add_argument("--motion-blur-probability", type=float, default=0.28,
                         help="整帧方向性运动模糊概率")
     parser.add_argument("--vignette-probability", type=float, default=0.45,
@@ -845,6 +1004,16 @@ def main():
         parser.error("--sensor-noise-std cannot be negative")
     if args.scene_profile == "generic" and not args.cc0textures:
         parser.error("generic scene profile requires a cc0textures path")
+    args.camera_model_dir = (os.path.abspath(args.camera_model_dir)
+                             if args.camera_model_dir else None)
+    if args.camera_model_dir:
+        refined_camera = os.path.isfile(os.path.join(args.camera_model_dir, "refined_camera.blend"))
+        required_files = ("model_info.json",) if refined_camera else ("base.obj", "texture_diffuse.png", "正面贴图.png")
+        for required in required_files:
+            if not os.path.isfile(os.path.join(args.camera_model_dir, required)):
+                parser.error(f"camera model asset missing: {required}")
+    else:
+        refined_camera = False
 
     rng = random.Random(args.seed)
     np.random.seed(args.seed)
@@ -855,6 +1024,14 @@ def main():
     bop_dataset_path = os.path.join(bop_parent_path, dataset_name)
     preview_dir = os.path.abspath(args.preview_dir) if args.preview_dir else None
     split_path = os.path.join(current_dir, args.output_split)
+    if not preview_dir and glob.glob(os.path.join(split_path, "*", "rgb", "*.jpg")):
+        config_file = os.path.join(split_path, "render_config.json")
+        old_config = {}
+        if os.path.isfile(config_file):
+            with open(config_file) as f:
+                old_config = json.load(f)
+        if old_config.get("camera_model_dir") != args.camera_model_dir:
+            raise ValueError("Camera asset differs from existing split. Choose a new --output-split.")
     staging_path = None
     if not preview_dir and args.output_split != "train_pbr":
         # BlenderProc's public writer hardcodes train_pbr. Render in an isolated
@@ -941,7 +1118,11 @@ def main():
     display_material = bproc.material.create("rear_screen_display")
     display_material.set_principled_shader_value("Base Color", [0.025, 0.045, 0.052, 1.0])
     display_material.set_principled_shader_value("Roughness", 0.18)
-    configure_screen_content(display_material)
+    configure_screen_content(
+        display_material,
+        (os.path.join(args.camera_model_dir, "正面贴图.png")
+         if args.camera_model_dir and not refined_camera else None),
+    )
     white_label_material = bproc.material.create("camera_white_label")
     white_label_material.set_principled_shader_value(
         "Base Color", [0.78, 0.80, 0.78, 1.0])
@@ -990,18 +1171,31 @@ def main():
     existing_rgb = glob.glob(os.path.join(split_path, "*", "rgb", "*.jpg"))
     metadata_start_id = len(existing_rgb)
 
-    objs = bproc.loader.load_bop_objs(bop_dataset_path=bop_dataset_path, mm2m=True, obj_ids=[1])
-    assert len(objs) == 1
-    objs += bproc.loader.load_bop_objs(bop_dataset_path=bop_dataset_path, mm2m=True, obj_ids=[1])
+    replacement_bounds_mm = None
+    if args.camera_model_dir:
+        objs, replacement_bounds_mm = load_replacement_camera_objects(
+            args.camera_model_dir, count=2,
+        )
+    else:
+        objs = bproc.loader.load_bop_objs(
+            bop_dataset_path=bop_dataset_path, mm2m=True, obj_ids=[1])
+        assert len(objs) == 1
+        objs += bproc.loader.load_bop_objs(
+            bop_dataset_path=bop_dataset_path, mm2m=True, obj_ids=[1])
+        for obj in objs:
+            obj.set_shading_mode("auto")
+            attach_model_pbr_maps(obj, os.path.join(bop_dataset_path, "models"))
     for obj in objs:
-        obj.set_shading_mode("auto")
-        attach_model_pbr_maps(obj, os.path.join(bop_dataset_path, "models"))
         if args.object_layer_preview:
             obj.set_scale(np.asarray(obj.get_scale()) * args.object_layer_scale)
 
     camera_parts = []
     proxy_scale = args.object_layer_scale if args.object_layer_preview else 1.0
+    appearance_face_sign = -1.0 if args.camera_model_dir else 1.0
     for _ in objs:
+        if refined_camera:
+            camera_parts.append({})
+            continue
         parts = create_camera_appearance_parts(
             proxy_scale,
             (bezel_material, display_material, white_label_material,
@@ -1201,7 +1395,7 @@ def main():
         placed = [info["mount"].copy() for info in arm_info]
         for obj in objs:
             mat = obj.get_materials()[0]
-            mat.set_principled_shader_value("Roughness", np.random.uniform(0.2, 0.9))
+            mat.set_principled_shader_value("Roughness", np.random.uniform(0.48, 0.68) if refined_camera else np.random.uniform(0.2, 0.9))
         instance_poses = []
         appearance_visibility = []
         for index, (obj, loc) in enumerate(zip(objs, placed)):
@@ -1252,15 +1446,19 @@ def main():
                 placed[index] = loc
             obj.set_location(loc)
             obj.set_rotation_mat(rotation_obj)
-            show_screen = args.rear_screen_proxy and rng.random() < 0.90
-            show_label = rng.random() < args.label_probability
-            show_tag = rng.random() < args.marker_probability
+            show_screen = args.rear_screen_proxy and (
+                bool(args.camera_model_dir) or rng.random() < 0.90)
+            show_label = (not args.camera_model_dir
+                          and rng.random() < args.label_probability)
+            show_tag = (not args.camera_model_dir
+                        and rng.random() < args.marker_probability)
             show_led = rng.random() < 0.45
             appearance_visibility.append(
                 (show_screen, show_label, show_tag, show_led))
             place_camera_appearance_parts(
                 camera_parts[index], loc, rotation_obj, proxy_scale,
-                show_screen, show_label, show_tag, show_led)
+                show_screen, show_label, show_tag, show_led,
+                face_sign=appearance_face_sign)
             is_active = index in active_indices
             obj.hide(not is_active)
             if not is_active:
@@ -1387,7 +1585,8 @@ def main():
                 loc, rotation_obj, _ = instance_poses[instance_index]
                 place_camera_appearance_parts(
                     camera_parts[instance_index], loc, rotation_obj, proxy_scale,
-                    *appearance_visibility[instance_index])
+                    *appearance_visibility[instance_index],
+                    face_sign=appearance_face_sign)
                 layer_data = bproc.renderer.render()
                 layer = uint8_color(layer_data["colors"][0])
                 if layer.shape[-1] != 4:
@@ -1505,6 +1704,15 @@ def main():
             json.dump(scene_metadata, f, indent=2)
         # Only remove the task-owned temporary directory after publishing scenes.
         shutil.rmtree(staging_path)
+    if not preview_dir and replacement_bounds_mm is not None:
+        os.makedirs(split_path, exist_ok=True)
+        with open(os.path.join(split_path, "render_config.json"), "w") as f:
+            json.dump({
+                "camera_model_dir": args.camera_model_dir,
+                "corner_bounds_mm": replacement_bounds_mm,
+                "screen_texture": "lcd.png" if refined_camera else "正面贴图.png",
+                "asset_version": "refined_action_camera_v1" if refined_camera else "external_obj",
+            }, f, indent=2, ensure_ascii=False)
     print("全部渲染完成")
 
 
